@@ -8,8 +8,13 @@
 //! The decoder is fail-closed: any structural anomaly returns `None`, matching
 //! every `return null` in the Kotlin implementation.
 
+pub mod announce;
+pub mod file_packet;
+pub mod fragment;
+pub mod noise_payload;
 pub mod packet;
 pub mod padding;
+pub mod sync;
 
 pub use packet::{
     MessageType, Packet, WirePayload, FLAG_HAS_RECIPIENT, FLAG_HAS_ROUTE, FLAG_HAS_SIGNATURE,
