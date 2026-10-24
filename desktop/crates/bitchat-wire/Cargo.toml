@@ -1,0 +1,8 @@
+[package]
+name = "bitchat-wire"
+description = "BitChat wire protocol codec: byte-exact Rust port of the Android client framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
