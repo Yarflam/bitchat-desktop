@@ -204,6 +204,17 @@ WirePayload rationale).
    answers `REQUEST_SYNC`, keeps store-and-forward.
 5. **P4 LAN/mDNS extension and ops hardening**: config, logs, uptime handling.
 
+## 9.1 No telemetry (hard requirement)
+
+The desktop node ships no analytics, crash reporters, phone-home calls, or
+third-party network dependencies. `bitchat-wire` is pure codec logic with zero
+network I/O; its dependency tree contains only crypto and compression crates
+(verified with `cargo tree`: no HTTP/socket stack anywhere). The only network
+surfaces of the node are the mesh transports themselves (BLE, optional LAN
+mDNS/TCP) and explicitly user-configured outbound connections (Tor). Anything
+that would transmit node state off-device requires a spec change and explicit
+review.
+
 ## 10. Out of scope (v1)
 
 - UI (headless daemon; management over local CLI/JSON-RPC only).
