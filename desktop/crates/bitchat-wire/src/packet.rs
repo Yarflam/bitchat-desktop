@@ -18,7 +18,7 @@
 //!    then raw-DEFLATE bytes
 //! 5. Signature: 64 bytes, if hasSignature
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub const HEADER_SIZE_V1: usize = 14;
 pub const HEADER_SIZE_V2: usize = 16;
@@ -80,9 +80,9 @@ impl MessageType {
 /// `for_payload` ties the bytes to the payload they decode to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WirePayload {
-    pub bytes: Rc<[u8]>,
+    pub bytes: Arc<[u8]>,
     pub compressed: bool,
-    pub for_payload: Rc<[u8]>,
+    pub for_payload: Arc<[u8]>,
 }
 
 /// A decoded (or to-be-encoded) BitChat packet.
@@ -461,18 +461,18 @@ fn decode_core(raw: &[u8], decompress: &Decompressor) -> Option<Packet> {
             return None;
         }
         let wire = WirePayload {
-            bytes: Rc::from(compressed.as_slice()),
+            bytes: Arc::from(compressed.as_slice()),
             compressed: true,
-            for_payload: Rc::from(expanded.as_slice()),
+            for_payload: Arc::from(expanded.as_slice()),
         };
         (expanded, Some(wire))
     } else {
         let bytes = raw[pos..pos + payload_length].to_vec();
         pos += payload_length;
         let wire = WirePayload {
-            bytes: Rc::from(bytes.as_slice()),
+            bytes: Arc::from(bytes.as_slice()),
             compressed: false,
-            for_payload: Rc::from(bytes.as_slice()),
+            for_payload: Arc::from(bytes.as_slice()),
         };
         (bytes, Some(wire))
     };
