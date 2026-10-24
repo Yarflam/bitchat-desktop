@@ -14,6 +14,7 @@ pub mod fragment;
 pub mod noise_payload;
 pub mod packet;
 pub mod padding;
+pub mod reassembly;
 pub mod sync;
 
 pub use packet::{
