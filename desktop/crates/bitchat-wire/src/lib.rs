@@ -9,6 +9,7 @@
 //! every `return null` in the Kotlin implementation.
 
 pub mod announce;
+pub mod compression;
 pub mod file_packet;
 pub mod fragment;
 pub mod noise_payload;

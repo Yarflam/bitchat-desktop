@@ -214,6 +214,44 @@ fn reencode_reuses_originator_compressed_bytes() {
 }
 
 #[test]
+fn real_compression_round_trips_through_packet_codec() {
+    // A compressible payload (100+ bytes, low entropy) must encode with the
+    // IS_COMPRESSED flag set, decode back to the exact payload, and re-encode
+    // byte-identically via the wire-payload reuse path (relay parity).
+    let mut payload = Vec::new();
+    for i in 0..300u32 {
+        payload.extend_from_slice(format!("mesh-{i:03}-").as_bytes());
+    }
+    assert!(bitchat_wire::compression::should_compress(&payload));
+
+    let mut p = packet(
+        1,
+        MessageType::Message as u8,
+        7,
+        4242,
+        "0102030405060708",
+        "",
+    );
+    p.payload = payload.clone();
+
+    let encoded = packet::encode(&p).unwrap();
+    // Sanity: compressed flag set, frame smaller than the raw payload.
+    assert_eq!(
+        packet::FLAG_IS_COMPRESSED,
+        encoded[11] & packet::FLAG_IS_COMPRESSED
+    );
+    assert!(encoded.len() < 14 + 8 + payload.len());
+
+    let decoded = packet::decode(&encoded).unwrap();
+    assert_eq!(payload, decoded.payload);
+    let reencoded = packet::encode(&decoded).unwrap();
+    assert_eq!(
+        encoded, reencoded,
+        "relay re-encode must reuse originator bytes"
+    );
+}
+
+#[test]
 fn compressed_guards_fail_closed() {
     let mk = |original_size: u16, compressed: &[u8]| -> Vec<u8> {
         let mut wire = Vec::new();

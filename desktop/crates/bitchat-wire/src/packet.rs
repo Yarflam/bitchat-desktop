@@ -167,11 +167,23 @@ pub fn encode(packet: &Packet) -> Option<Vec<u8>> {
 
     // Re-encode of a decoded packet: reuse the originator's wire bytes.
     let mut payload: &[u8] = &packet.payload;
+    let owned_payload: Vec<u8>;
     let mut original_payload_size: Option<usize> = None;
     let mut is_compressed = false;
     if let Some(wire) = &packet.wire_payload {
         if wire.for_payload.as_ref() == packet.payload.as_slice() && wire.compressed {
             payload = &wire.bytes;
+            original_payload_size = Some(packet.payload.len());
+            is_compressed = true;
+        }
+    }
+    // Compress only when the heuristic agrees and the result is smaller;
+    // DEFLATE output is not canonical across encoders, so cross-client
+    // parity lives in the decode direction (see the compression module).
+    if !is_compressed && crate::compression::should_compress(&packet.payload) {
+        if let Some(compressed) = crate::compression::compress(&packet.payload) {
+            owned_payload = compressed;
+            payload = &owned_payload;
             original_payload_size = Some(packet.payload.len());
             is_compressed = true;
         }
@@ -284,9 +296,10 @@ pub fn encode(packet: &Packet) -> Option<Vec<u8>> {
 pub type Decompressor<'a> = dyn Fn(&[u8], usize) -> Option<Vec<u8>> + 'a;
 
 /// Decode a packet, first trying the bytes as-is and then unpadding.
-/// Mirrors `BinaryProtocol.decode`.
+/// Mirrors `BinaryProtocol.decode`; the production decompressor is the raw
+/// DEFLATE implementation in `crate::compression`.
 pub fn decode(data: &[u8]) -> Option<Packet> {
-    decode_with(data, &|_, _| None)
+    decode_with(data, &crate::compression::decompress)
 }
 
 /// Decode with an explicit decompressor (test seam mirroring

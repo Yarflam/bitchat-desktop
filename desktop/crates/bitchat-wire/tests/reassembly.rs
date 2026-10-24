@@ -9,12 +9,22 @@ use bitchat_wire::reassembly::{
 };
 
 fn big_packet(payload_size: usize) -> Packet {
-    let mut p = Packet::new(
-        MessageType::Message as u8,
-        7,
-        [0xAA; 8],
-        vec![0x55u8; payload_size],
-    );
+    // Incompressible pseudo-random payload (SplitMix64-style, no rand
+    // dependency) so encode() does not deflate it below the 512 threshold
+    // before fragmentation planning, matching how the Kotlin tests behave
+    // with real high-entropy payloads.
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let payload: Vec<u8> = (0..payload_size)
+        .map(|_| {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            (z >> 56) as u8
+        })
+        .collect();
+    let mut p = Packet::new(MessageType::Message as u8, 7, [0xAA; 8], payload);
     p.timestamp = 12345;
     p
 }
