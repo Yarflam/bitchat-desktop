@@ -12,6 +12,7 @@ pub mod announce;
 pub mod compression;
 pub mod file_packet;
 pub mod fragment;
+pub mod identity;
 pub mod noise;
 pub mod noise_payload;
 pub mod packet;
