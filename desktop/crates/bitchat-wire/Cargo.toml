@@ -7,3 +7,8 @@ license.workspace = true
 
 [dependencies]
 flate2 = "1"
+sha2 = "0.10"
+snow = "0.10"
+
+[dev-dependencies]
+chacha20poly1305 = "0.10"

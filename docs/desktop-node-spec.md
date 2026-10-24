@@ -101,9 +101,12 @@ Unknown types ⇒ ignore packet, keep connection alive.
   - `0x05` capabilities (optional, little-endian bitfield; advertise only bits
     the node implements)
   - Unknown TLVs MUST be ignored; malformed required TLVs ⇒ reject announce.
-- Handshake: `Noise_XX_25519_ChaChaPoly_SHA256`. Prologue and handshake
-  message size validation must match `NoiseSession.kt`; interop is pinned by
-  the Cacophony vector in `NoiseExternalVectorTest` — port it verbatim.
+- Handshake: `Noise_XX_25519_ChaChaPoly_SHA256`, no prologue. Handshake
+  payloads are always encrypted, so the on-wire messages are 32 / 96 / 64
+  bytes (messages 2 and 3 include the 16-byte MAC of the empty payload —
+  the vendored noise-java writer calls `encryptAndHash(..., 0)` even for a
+  null payload). Interop is pinned by the Cacophony vector in
+  `NoiseExternalVectorTest` — ported as `desktop/crates/bitchat-wire/tests/noise_vector.rs`.
 - Transport data: NoisePayload envelope (`type:1, payload:n`) inside
   NOISE_ENCRYPTED. Rekey limits per `AppConstants.Noise` (1 h / 1000 msgs
   service policy, 10 000 session ceiling, 256-byte max Noise payload).
