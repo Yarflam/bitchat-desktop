@@ -943,9 +943,14 @@ impl Actor {
 
         let plaintext = {
             let Some(session) = self.sessions.get_mut(sender) else {
+                // Our session state can vanish during link churn (peer
+                // reconnects over the other role). Ask for a fresh handshake
+                // instead of staying deaf: the phone answers a 0x10 even when
+                // it still holds a session, and re-establishes with new keys.
                 self.info(format!(
-                    "NOISE_ENCRYPTED from {sender} without session; ignored"
+                    "NOISE_ENCRYPTED from {sender} without session; requesting re-handshake"
                 ));
+                self.initiate_handshake(sender).await;
                 return;
             };
             let out = session.decrypt(&packet.payload);
@@ -1011,6 +1016,8 @@ impl Actor {
                     self.info(format!(
                         "session with {sender} dropped after decrypt failures"
                     ));
+                    // Re-handshake so the next peer message has a live session.
+                    self.initiate_handshake(sender).await;
                 }
             }
         }
