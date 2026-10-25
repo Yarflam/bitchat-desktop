@@ -38,6 +38,8 @@ impl Route {
 const MAX_TTL: u8 = 7;
 /// Sync packets stay neighbor-only, mirror of `AppConstants.SYNC_TTL_HOPS`.
 const SYNC_TTL: u8 = 0;
+/// Mesh-wide recipient, port of `SpecialRecipients.BROADCAST` (8 x 0xFF).
+pub const BROADCAST_RECIPIENT: [u8; 8] = [0xff; 8];
 /// Announcements older than this are pruned from the gossip store, mirror of
 /// `AppConstants.Mesh.STALE_PEER_TIMEOUT_MS`.
 const STALE_ANNOUNCE_MS: u64 = 180_000;
@@ -111,6 +113,8 @@ pub enum LinkEvent {
 #[derive(Debug)]
 pub enum LinkCommand {
     SendPrivateMessage { peer_id: String, content: String },
+    /// Mesh-wide broadcast message.
+    SendBroadcastMessage { content: String },
     /// Send a gossip sync request; `None` broadcasts to all neighbors.
     SendSyncRequest { target: Option<String> },
     Shutdown,
@@ -195,6 +199,16 @@ impl MeshLink {
             .map_err(|_| LinkError::Closed)
     }
 
+    /// Send a mesh-wide broadcast message (the common channel).
+    pub async fn send_broadcast_message(&self, content: &str) -> Result<(), LinkError> {
+        self.commands
+            .send(LinkCommand::SendBroadcastMessage {
+                content: content.to_string(),
+            })
+            .await
+            .map_err(|_| LinkError::Closed)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.commands.send(LinkCommand::Shutdown).await;
     }
@@ -259,6 +273,9 @@ impl Actor {
                     }
                     Some(LinkCommand::SendSyncRequest { target }) => {
                         self.send_request_sync(target).await;
+                    }
+                    Some(LinkCommand::SendBroadcastMessage { content }) => {
+                        self.send_broadcast_message(&content).await;
                     }
                     Some(LinkCommand::Shutdown) | None => break,
                 },
@@ -552,7 +569,10 @@ impl Actor {
 
     /// Handle a broadcast mesh message: store, surface, and relay.
     async fn handle_broadcast_message(&mut self, sender: &str, packet: Packet, via: Route) {
-        let is_broadcast = packet.recipient_id.is_none();
+        // Broadcast means no recipient or the all-0xFF pseudo-recipient,
+        // mirroring `PacketProcessor`'s isBroadcast check.
+        let is_broadcast =
+            packet.recipient_id.is_none_or(|recipient| recipient == BROADCAST_RECIPIENT);
         if !is_broadcast {
             // Directed messages ride Noise; unexpected on the clear channel.
             self.info(format!("ignoring directed MESSAGE from {sender}"));
@@ -574,12 +594,35 @@ impl Actor {
             return;
         }
         self.store_broadcast_message(id, packet.clone());
-        let content = decode_message_content(&packet.payload);
+        // The broadcast payload is the raw UTF-8 text (`sendMessage`).
+        let content = String::from_utf8_lossy(&packet.payload).into_owned();
         let _ = self.events.try_send(LinkEvent::BroadcastMessage {
             peer_id: sender.to_string(),
             content,
         });
         self.relay_public_packet(&packet, &via);
+    }
+
+    /// Send a mesh-wide broadcast message (`BluetoothMeshService.sendMessage`).
+    async fn send_broadcast_message(&mut self, content: &str) {
+        let mut packet = Packet::new(
+            MessageType::Message as u8,
+            MAX_TTL,
+            self.identity.peer_id_bytes(),
+            content.as_bytes().to_vec(),
+        );
+        packet.timestamp = now_ms();
+        packet.recipient_id = Some(BROADCAST_RECIPIENT);
+        packet.signature = self.identity.signing.sign_packet(&packet);
+
+        // Track our own broadcast for gossip sync, then flood our routes.
+        let id = Self::packet_sync_id(&packet);
+        self.mark_seen(id);
+        self.store_broadcast_message(id, packet.clone());
+        let routes: Vec<Route> = self.routes.values().cloned().collect();
+        for route in routes {
+            self.send_frame(&route, &packet);
+        }
     }
 
     fn store_broadcast_message(&mut self, id: [u8; 16], packet: Packet) {
@@ -1163,24 +1206,6 @@ impl Actor {
     }
 }
 
-/// Best-effort content extraction for a broadcast MESSAGE payload: TLV
-/// `0x01` holds the UTF-8 text; unknown TLVs are skipped.
-fn decode_message_content(payload: &[u8]) -> String {
-    let mut offset = 0usize;
-    while offset + 2 <= payload.len() {
-        let tlv_type = payload[offset];
-        let length = usize::from(payload[offset + 1]);
-        offset += 2;
-        if offset + length > payload.len() {
-            break;
-        }
-        if tlv_type == 0x01 {
-            return String::from_utf8_lossy(&payload[offset..offset + length]).into_owned();
-        }
-        offset += length;
-    }
-    String::new()
-}
 
 /// Start the GATT server on Windows; a never-fed event stream elsewhere.
 #[cfg(windows)]

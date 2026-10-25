@@ -5,6 +5,8 @@
 //!   cargo run -p bitchat-node --example node_chat
 //!   cargo run -p bitchat-node --example node_chat -- "Hello from bitchatd!"
 //!       (sends the message to the first peer whose session establishes)
+//!   cargo run -p bitchat-node --example node_chat -- "#hello mesh"
+//!       (broadcasts to the common channel once a peer is announced)
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -47,11 +49,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "[announce] {nickname} ({peer_id}) verified={verified} caps={capabilities:?}"
                     );
-                    // Queueing now also triggers the Noise handshake; the
-                    // message is delivered as soon as the session is up.
                     if let (Some(text), None) = (&message, &sent_to) {
-                        println!("[chat    ] sending private message to {peer_id}...");
-                        link.send_private_message(&peer_id, text).await?;
+                        if let Some(broadcast) = text.strip_prefix('#') {
+                            println!("[chat    ] broadcasting to the mesh...");
+                            link.send_broadcast_message(broadcast).await?;
+                        } else {
+                            // Queueing now also triggers the Noise handshake;
+                            // the message is delivered once the session is up.
+                            println!("[chat    ] sending private message to {peer_id}...");
+                            link.send_private_message(&peer_id, text).await?;
+                        }
                         sent_to = Some(peer_id.clone());
                     }
                 }
