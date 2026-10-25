@@ -287,8 +287,16 @@ mod imp {
                     "custom advertisement unavailable ({error}); \
                      advertising service UUID only"
                 )));
+                let adv_params =
+                    GattServiceProviderAdvertisingParameters::new().map_err(|e| e.to_string())?;
+                adv_params
+                    .SetIsDiscoverable(true)
+                    .map_err(|e| e.to_string())?;
+                adv_params
+                    .SetIsConnectable(true)
+                    .map_err(|e| e.to_string())?;
                 provider
-                    .StartAdvertising()
+                    .StartAdvertisingWithParameters(&adv_params)
                     .map_err(|e| format!("start advertising: {e}"))?;
                 let _ = event_tx.send(PeripheralEvent::AdvertisingStarted);
                 None
