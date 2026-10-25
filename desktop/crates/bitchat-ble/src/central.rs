@@ -32,6 +32,10 @@ use crate::frame::{
 
 /// How long to wait for service discovery before giving up on a connection.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for the transport connection itself. Slightly above the
+/// platform default: an existing system-level GATT session to the peer (e.g.
+/// Windows auto-connecting to a paired device) makes the first attempt slow.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 /// How long to wait for the adapter list at startup.
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -86,9 +90,27 @@ pub enum CentralEventOut {
 #[derive(Debug)]
 pub enum CentralCommand {
     Connect(PeripheralId),
+    /// Connect directly to a known MAC address, without scanning — for
+    /// bonded peers whose advertisement is unreachable or disabled.
+    ConnectByAddress([u8; 6]),
     Disconnect(PeripheralId),
-    Send { id: PeripheralId, packet: Packet },
+    Send {
+        id: PeripheralId,
+        packet: Packet,
+    },
     Shutdown,
+}
+
+fn peripheral_id_from_address(address: [u8; 6]) -> Option<PeripheralId> {
+    #[cfg(windows)]
+    {
+        Some(PeripheralId::from(btleplug::api::BDAddr::from(address)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = address;
+        None
+    }
 }
 
 /// Handle for driving a running [`CentralNode`].
@@ -193,23 +215,16 @@ async fn central_loop(
                         if connections.contains_key(&id) {
                             continue;
                         }
-                        let peripheral = adapter.peripheral(&id).await.map_err(CentralError::Ble)?;
-                        match connect_peer(&peripheral).await {
-                            Ok(connection) => {
-                                let connection = Arc::new(connection);
-                                connections.insert(id.clone(), connection.clone());
-                                let info = known.get(&id).cloned().unwrap_or(PeerInfo {
-                                    id: id.clone(),
-                                    address: peripheral.address().to_string(),
-                                    advertised_peer_id: None,
-                                    rssi: None,
-                                });
-                                let _ = events.send(CentralEventOut::Connected { id: id.clone(), info }).await;
-                                spawn_notification_loop(peripheral, id, events.clone());
+                        connect_and_track(&adapter, &mut connections, &mut known, &id, events.clone()).await;
+                    }
+                    CentralCommand::ConnectByAddress(address) => {
+                        match peripheral_id_from_address(address) {
+                            Some(id) if !connections.contains_key(&id) => {
+                                connect_and_track(&adapter, &mut connections, &mut known, &id, events.clone()).await;
                             }
-                            Err(e) => {
+                            _ => {
                                 let _ = events.send(CentralEventOut::AdapterLost(format!(
-                                    "connect failed for {id}: {e}"
+                                    "connect-by-address unsupported for {address:02x?}"
                                 ))).await;
                             }
                         }
@@ -254,8 +269,56 @@ async fn central_loop(
     Ok(())
 }
 
+async fn connect_and_track(
+    adapter: &btleplug::platform::Adapter,
+    connections: &mut HashMap<PeripheralId, Arc<Connection>>,
+    known: &mut HashMap<PeripheralId, PeerInfo>,
+    id: &PeripheralId,
+    events: mpsc::Sender<CentralEventOut>,
+) {
+    let peripheral = match adapter.peripheral(id).await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = events
+                .send(CentralEventOut::AdapterLost(format!(
+                    "lookup failed for {id}: {e}"
+                )))
+                .await;
+            return;
+        }
+    };
+    match connect_peer(&peripheral).await {
+        Ok(connection) => {
+            connections.insert(id.clone(), Arc::new(connection));
+            let info = known.get(id).cloned().unwrap_or(PeerInfo {
+                id: id.clone(),
+                address: peripheral.address().to_string(),
+                advertised_peer_id: None,
+                rssi: None,
+            });
+            let _ = events
+                .send(CentralEventOut::Connected {
+                    id: id.clone(),
+                    info,
+                })
+                .await;
+            spawn_notification_loop(peripheral, id.clone(), events);
+        }
+        Err(e) => {
+            let _ = events
+                .send(CentralEventOut::AdapterLost(format!(
+                    "connect failed for {id}: {e}"
+                )))
+                .await;
+        }
+    }
+}
+
 async fn connect_peer(peripheral: &Peripheral) -> Result<Connection, CentralError> {
-    peripheral.connect().await.map_err(CentralError::Ble)?;
+    peripheral
+        .connect_with_timeout(CONNECT_TIMEOUT)
+        .await
+        .map_err(CentralError::Ble)?;
     let result = async {
         peripheral
             .discover_services_with_timeout(DISCOVERY_TIMEOUT)

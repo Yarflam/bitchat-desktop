@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adapter.start_scan(Default::default()).await?;
 
     let mut events = adapter.events().await?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
     let mut seen = std::collections::HashSet::new();
 
     while tokio::time::Instant::now() < deadline {
