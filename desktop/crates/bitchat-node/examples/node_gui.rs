@@ -176,6 +176,11 @@ struct BitchatApp {
     pending_notifs: Vec<(String, String)>,
     /// Recently scanned devices (like the mobile debug scan list).
     scan: Vec<ScanEntry>,
+    /// Last desktop notification shown (rate-limit: toasts steal OS focus).
+    last_notif: Option<std::time::Instant>,
+    /// Short grace period after the window regains focus during which no
+    /// notification may fire, so a toast can never interrupt typing.
+    notif_mute_until: Option<std::time::Instant>,
 }
 
 const MAX_LOG_LINES: usize = 60;
@@ -1051,17 +1056,39 @@ impl eframe::App for BitchatApp {
 
 
         // Desktop notifications for incoming messages while unfocused.
+        // Toasts steal OS focus, so they are rate-limited (one collapsed toast
+        // per burst) and muted briefly after the window regains focus.
         if !self.pending_notifs.is_empty() {
             let focused = ctx.input(|input| input.focused);
+            let now = std::time::Instant::now();
             if focused {
                 self.pending_notifs.clear();
+                self.notif_mute_until = Some(now + Duration::from_secs(5));
             } else {
-                for (who, text) in self.pending_notifs.drain(..) {
+                let muted = self
+                    .notif_mute_until
+                    .is_some_and(|until| now < until);
+                let due = self
+                    .last_notif
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(15));
+                if !muted && due {
+                    let count = self.pending_notifs.len();
+                    let (who, text) = self.pending_notifs.last().cloned().unwrap();
+                    self.pending_notifs.clear();
+                    let body = if count > 1 {
+                        format!(
+                            "{count} new messages · last {who}: {}",
+                            truncate_chars(&text, 90)
+                        )
+                    } else {
+                        format!("{who}: {}", truncate_chars(&text, 120))
+                    };
                     notify_rust::Notification::new()
                         .summary("bitchatd")
-                        .body(&format!("{who}: {}", truncate_chars(&text, 120)))
+                        .body(&body)
                         .show()
                         .ok();
+                    self.last_notif = Some(now);
                 }
             }
         }
@@ -1387,6 +1414,8 @@ fn main() -> eframe::Result<()> {
         focus_composer: false,
         pending_notifs: Vec::new(),
         scan: Vec::new(),
+        last_notif: None,
+        notif_mute_until: None,
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
