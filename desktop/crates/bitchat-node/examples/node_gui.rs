@@ -1156,7 +1156,6 @@ impl eframe::App for BitchatApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let input = egui::TextEdit::singleline(&mut self.draft)
-                    .id(egui::Id::new("composer"))
                     .hint_text(
                         egui::RichText::new("Type a message…").color(TEXT_TERTIARY),
                     )
@@ -1171,8 +1170,8 @@ impl eframe::App for BitchatApp {
                     .show(ui, |ui| ui.add(input))
                     .inner;
                 if self.focus_composer {
-                    // Re-grab focus in the same frame the widget exists, so
-                    // typing continues right after sending or switching.
+                    // Re-grab focus on the frame right after sending or
+                    // switching conversation, so typing can continue.
                     self.focus_composer = false;
                     response.request_focus();
                 }
