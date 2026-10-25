@@ -15,4 +15,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 eframe = "0.31"
+notify-rust = "4"
 windows = { version = "0.61", features = ["ApplicationModel"] }

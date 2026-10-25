@@ -31,6 +31,7 @@ const TEXT_TERTIARY: egui::Color32 = egui::Color32::from_rgb(0x8F, 0x9C, 0x8F);
 const INPUT_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0B);
 const INPUT_BORDER: egui::Color32 = egui::Color32::from_rgb(0x33, 0x36, 0x35);
 const ROW_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x10, 0x1D, 0x12);
+const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x10, 0x0D);
 
 fn terminal_style(ctx: &egui::Context) {
     use eframe::egui::{FontFamily, FontId, TextStyle};
@@ -136,6 +137,12 @@ enum Selection {
     Peer(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Info,
+    Settings,
+}
+
 struct BitchatApp {
     events_in: std_mpsc::Receiver<LinkEvent>,
     cmd_out: std_mpsc::Sender<UiCommand>,
@@ -150,9 +157,66 @@ struct BitchatApp {
     selected: Selection,
     draft: String,
     start_signal: Option<std_mpsc::Sender<()>>,
+    show_settings: bool,
+    settings_tab: SettingsTab,
+    show_debug: bool,
+    /// Re-grab the composer after sending or switching conversation.
+    focus_composer: bool,
+    /// Incoming messages waiting for a focus check before desktop notification.
+    pending_notifs: Vec<(String, String)>,
 }
 
 const MAX_LOG_LINES: usize = 60;
+
+/// Section label in the settings windows, like `AboutSectionLabel`.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(text).color(GREEN).strong());
+    ui.add_space(4.0);
+}
+
+/// A settings row with a leading status-dot "icon", title, subtitle and a
+/// trailing state label. Disabled rows render dimmed (Android grise l'option).
+fn settings_row(
+    ui: &mut egui::Ui,
+    icon: egui::Color32,
+    title: &str,
+    subtitle: &str,
+    state: &str,
+    enabled: bool,
+) {
+    let (title_color, sub_color) = if enabled {
+        (TEXT, TEXT_TERTIARY)
+    } else {
+        (
+            egui::Color32::from_rgb(0x6B, 0x70, 0x6B),
+            egui::Color32::from_rgb(0x4A, 0x4F, 0x4A),
+        )
+    };
+    egui::Frame::new()
+        .fill(SURFACE)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                status_dot(ui, icon);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).color(title_color).strong());
+                    ui.label(egui::RichText::new(subtitle).small().color(sub_color));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let state_color = if enabled {
+                        if state == "ON" || state == "✓" { GREEN } else { TEXT_TERTIARY }
+                    } else {
+                        egui::Color32::from_rgb(0x4A, 0x4F, 0x4A)
+                    };
+                    ui.label(egui::RichText::new(state).small().color(state_color));
+                });
+            });
+        });
+    ui.add_space(4.0);
+}
 
 impl BitchatApp {
     fn nickname_path(identity_path: &Path) -> PathBuf {
@@ -207,10 +271,14 @@ impl BitchatApp {
                 peer_id, content, ..
             } => {
                 let nickname = self.nickname_of(&peer_id);
+                self.pending_notifs
+                    .push((format!("@{} (private)", nickname), content.clone()));
                 self.push_line(&peer_id, &nickname, content);
             }
             LinkEvent::BroadcastMessage { peer_id, content } => {
                 let nickname = self.nickname_of(&peer_id);
+                self.pending_notifs
+                    .push((format!("@{} (broadcast)", nickname), content.clone()));
                 self.push_line(CHANNEL_KEY, &nickname, content);
             }
             LinkEvent::Delivered { peer_id, .. } => {
@@ -312,6 +380,7 @@ impl BitchatApp {
             }
         }
         self.draft.clear();
+        self.focus_composer = true;
     }
 
     fn show_nickname_editor(&mut self, ui: &mut egui::Ui, identity_path: &Path) {
@@ -382,6 +451,7 @@ impl BitchatApp {
         );
         if channel_click.clicked() {
             self.selected = Selection::Broadcast;
+            self.focus_composer = true;
         }
         ui.add_space(6.0);
         ui.label(egui::RichText::new("PEERS").small().color(TEXT_TERTIARY));
@@ -435,6 +505,7 @@ impl BitchatApp {
             });
         if let Some(selection) = pick {
             self.selected = selection;
+            self.focus_composer = true;
         }
 
         ui.separator();
@@ -527,6 +598,331 @@ impl BitchatApp {
                 }
             });
     }
+    /// About / Settings window mirroring the Android About sheet tabs.
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("bitchatd · settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (SettingsTab::Info, "Info"),
+                        (SettingsTab::Settings, "Settings"),
+                    ] {
+                        let selected = self.settings_tab == tab;
+                        if ui
+                            .selectable_label(selected, label)
+                            .clicked()
+                            && !selected
+                        {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
+                ui.separator();
+
+                match self.settings_tab {
+                    SettingsTab::Info => {
+                        section_label(ui, "About");
+                        settings_row(
+                            ui,
+                            GREEN,
+                            "Offline Communication",
+                            "Chat over a Bluetooth mesh with no internet and no servers. \
+                             Messages relay through nearby devices to extend range.",
+                            "",
+                            true,
+                        );
+                        settings_row(
+                            ui,
+                            GREEN,
+                            "End-to-End Encryption",
+                            "Private messages are encrypted. Channel messages are public.",
+                            "",
+                            true,
+                        );
+                        settings_row(
+                            ui,
+                            TEXT_TERTIARY,
+                            "Online Geohash",
+                            "Location-based channels over Nostr relays. Not available on desktop.",
+                            "unsupported",
+                            false,
+                        );
+
+                        section_label(ui, "How To Use");
+                        for hint in [
+                            "Set your nickname by clicking it in the header",
+                            "Switch between the common channel and private messages in the list",
+                            "Type a message and press Enter to send",
+                            "Broadcasts reach the whole mesh; private messages use a Noise session",
+                        ] {
+                            ui.horizontal(|ui| {
+                                status_dot(ui, TEXT_TERTIARY);
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new(hint).small().color(TEXT));
+                            });
+                            ui.add_space(4.0);
+                        }
+                    }
+                    SettingsTab::Settings => {
+                        section_label(ui, "Settings");
+                        settings_row(
+                            ui,
+                            BLUE,
+                            "Run in Background",
+                            "Keep the mesh node running when the window is closed (detached process).",
+                            "ON",
+                            false,
+                        );
+                        settings_row(
+                            ui,
+                            AMBER,
+                            "Live push-to-talk",
+                            "Play voice bursts live on the mesh; voice notes are always sent on release.",
+                            "not available on desktop",
+                            false,
+                        );
+                        settings_row(
+                            ui,
+                            AMBER,
+                            "Proof of Work",
+                            "Add proof of work to geohash messages for spam deterrence.",
+                            "not available on desktop",
+                            false,
+                        );
+                        settings_row(
+                            ui,
+                            TEXT_TERTIARY,
+                            "Tor Network",
+                            "Route internet over Tor for enhanced privacy.",
+                            "not available on desktop",
+                            false,
+                        );
+                        ui.add_space(8.0);
+                        ui.separator();
+                        let debug_row = egui::Frame::new()
+                            .fill(SURFACE)
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, GREEN);
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Debug Settings")
+                                                .color(TEXT)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Diagnostics, transports, sync parameters and console",
+                                            )
+                                            .small()
+                                            .color(TEXT_TERTIARY),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("open ▸")
+                                                    .small()
+                                                    .color(GREEN),
+                                            );
+                                        },
+                                    );
+                                });
+                            })
+                            .response;
+                        let debug_click = ui.interact(
+                            debug_row.rect,
+                            egui::Id::new("debug_row"),
+                            egui::Sense::click(),
+                        );
+                        if debug_click.clicked() {
+                            self.show_debug = true;
+                        }
+                        debug_click.on_hover_text("open the debug settings");
+                    }
+                }
+            });
+        self.show_settings = open;
+    }
+
+    /// Debug sheet mirroring the Android Debug Settings sections.
+    fn show_debug_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_debug;
+        egui::Window::new("bitchatd · debug settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .default_height(520.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    section_label(ui, "Logging");
+                    settings_row(
+                        ui,
+                        BLUE,
+                        "Verbose logging",
+                        "Hex packet dumps; enabled by the launcher (BITCHATD_DEBUG_HEX).",
+                        "ON",
+                        false,
+                    );
+
+                    section_label(ui, "Mesh topology");
+                    let sessions = self
+                        .peers
+                        .iter()
+                        .filter(|peer| peer.has_session)
+                        .count();
+                    let verified = self.peers.iter().filter(|peer| peer.verified).count();
+                    settings_row(
+                        ui,
+                        GREEN,
+                        "Gossip",
+                        if self.peers.is_empty() {
+                            "No gossip yet".to_string()
+                        } else {
+                            format!(
+                                "{} peer(s) · {} verified · {} encrypted session(s)",
+                                self.peers.len(),
+                                verified,
+                                sessions
+                            )
+                        }
+                        .as_str(),
+                        "",
+                        !self.peers.is_empty(),
+                    );
+
+                    section_label(ui, "Bluetooth roles");
+                    settings_row(
+                        ui,
+                        BLUE,
+                        "GATT server",
+                        "Advertises the mesh service and accepts incoming BLE connections.",
+                        "ON",
+                        false,
+                    );
+                    settings_row(
+                        ui,
+                        BLUE,
+                        "GATT client",
+                        format!("Auto-connects to discovered peers ({} known).", self.peers.len())
+                            .as_str(),
+                        "ON",
+                        false,
+                    );
+
+                    section_label(ui, "Transports");
+                    settings_row(ui, GREEN, "BLE", "Bluetooth Low Energy mesh transport.", "ON", false);
+                    settings_row(
+                        ui,
+                        TEXT_TERTIARY,
+                        "Wi-Fi Aware",
+                        "Wi-Fi Aware is not supported on this platform.",
+                        "unsupported",
+                        false,
+                    );
+
+                    section_label(ui, "Packet relay");
+                    settings_row(
+                        ui,
+                        GREEN,
+                        "Relay",
+                        "Verified public packets are relayed to extend the mesh.",
+                        "ON",
+                        false,
+                    );
+
+                    section_label(ui, "Sync settings");
+                    settings_row(
+                        ui,
+                        BLUE,
+                        "GCS filter",
+                        format!(
+                            "seen capacity {} · filter {} bytes · target fpr {:.1}%",
+                            bitchat_wire::gcs::SEEN_CAPACITY,
+                            bitchat_wire::gcs::DEFAULT_FILTER_BYTES,
+                            bitchat_wire::gcs::DEFAULT_FPR * 100.0
+                        )
+                        .as_str(),
+                        "",
+                        true,
+                    );
+
+                    section_label(ui, "Connected devices");
+                    if self.peers.is_empty() {
+                        ui.label(
+                            egui::RichText::new("None")
+                                .small()
+                                .color(TEXT_TERTIARY),
+                        );
+                    }
+                    for peer in &self.peers {
+                        let dot = if peer.has_session {
+                            GREEN
+                        } else if peer.verified {
+                            AMBER
+                        } else {
+                            TEXT_TERTIARY
+                        };
+                        settings_row(
+                            ui,
+                            dot,
+                            format!("@{} · {}", peer.nickname, &peer.peer_id[..8]).as_str(),
+                            if peer.has_session {
+                                "session chiffree [tls]"
+                            } else if peer.verified {
+                                "verified, handshake pending"
+                            } else {
+                                "unverified announce"
+                            },
+                            "",
+                            true,
+                        );
+                    }
+
+                    section_label(ui, "Recent scan results");
+                    settings_row(
+                        ui,
+                        TEXT_TERTIARY,
+                        "Scanner",
+                        "Results are consumed immediately by auto-connect; nothing is buffered.",
+                        "auto",
+                        false,
+                    );
+
+                    section_label(ui, "Debug console");
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("debug_console")
+                                .max_height(200.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &self.logs {
+                                        ui.label(
+                                            egui::RichText::new(format!("# {line}"))
+                                                .small()
+                                                .color(TEXT_TERTIARY),
+                                        );
+                                    }
+                                });
+                        });
+                });
+            });
+        self.show_debug = open;
+    }
 }
 
 impl eframe::App for BitchatApp {
@@ -541,6 +937,28 @@ impl eframe::App for BitchatApp {
         }
         ctx.request_repaint_after(Duration::from_millis(300));
 
+        // Keep the composer focused after sending or switching conversation.
+        if self.focus_composer {
+            self.focus_composer = false;
+            ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("composer")));
+        }
+
+        // Desktop notifications for incoming messages while unfocused.
+        if !self.pending_notifs.is_empty() {
+            let focused = ctx.input(|input| input.focused);
+            if focused {
+                self.pending_notifs.clear();
+            } else {
+                for (who, text) in self.pending_notifs.drain(..) {
+                    notify_rust::Notification::new()
+                        .summary("bitchatd")
+                        .body(&format!("{who}: {}", truncate_chars(&text, 120)))
+                        .show()
+                        .ok();
+                }
+            }
+        }
+
         let identity_path = PathBuf::from(
             std::env::var("BITCHATD_IDENTITY").unwrap_or_else(|_| "bitchatd.identity".to_string()),
         );
@@ -551,6 +969,20 @@ impl eframe::App for BitchatApp {
             ui.horizontal(|ui| {
                 self.show_nickname_editor(ui, &identity_path);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("⚙").heading().color(TEXT),
+                            )
+                            .fill(BG)
+                            .corner_radius(6),
+                        )
+                        .on_hover_text("settings & about")
+                        .clicked()
+                    {
+                        self.show_settings = true;
+                    }
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(format!("👥 {}", self.peers.len()))
                             .heading()
@@ -583,6 +1015,7 @@ impl eframe::App for BitchatApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let input = egui::TextEdit::singleline(&mut self.draft)
+                    .id(egui::Id::new("composer"))
                     .hint_text(
                         egui::RichText::new("Type a message…").color(TEXT_TERTIARY),
                     )
@@ -651,10 +1084,27 @@ impl eframe::App for BitchatApp {
             self.show_messages(ui, &key);
         });
 
+        if self.show_settings {
+            self.show_settings_window(ctx);
+        }
+        if self.show_debug {
+            self.show_debug_window(ctx);
+        }
+
         // Hand cursor over any clickable widget.
         if ctx.is_pointer_over_area() {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+    }
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
@@ -792,6 +1242,11 @@ fn main() -> eframe::Result<()> {
         chat: HashMap::new(),
         selected: Selection::Broadcast,
         draft: String::new(),
+        show_settings: false,
+        settings_tab: SettingsTab::Info,
+        show_debug: false,
+        focus_composer: false,
+        pending_notifs: Vec::new(),
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
