@@ -568,12 +568,23 @@ impl Actor {
             capabilities: announce.capabilities.map(|c| c.0 as u16),
         });
 
-        // The phone client only starts its Noise handshake when the user
-        // sends a message (dropping that first message), so when a peer
-        // connected to our GATT server we take the initiative instead. The
-        // phone answers an incoming 0x10 even with an existing session, so
-        // the session is ready before the user types anything.
         if via.central.is_none() && via.peripheral.is_some() {
+            // Prefer a single link per peer, mirroring the phone client's
+            // duplicate-connection avoidance: two GATT sessions to the same
+            // device fight over one BLE ACL, churning both. When the peer
+            // connects to our GATT server, drop our outgoing central link.
+            let central_id = self.routes.get(&sender).and_then(|r| r.central.clone());
+            if let Some(id) = central_id {
+                self.info(format!(
+                    "{sender} on our GATT server; dropping our central link (single-link preference)"
+                ));
+                let _ = self.central_commands.send(CentralCommand::Disconnect(id)).await;
+            }
+            // The phone client only starts its Noise handshake when the user
+            // sends a message (dropping that first message), so when a peer
+            // connected to our GATT server we take the initiative instead.
+            // The phone answers an incoming 0x10 even with an existing
+            // session, so the channel is ready before the user types.
             self.initiate_handshake(&sender).await;
         }
     }
