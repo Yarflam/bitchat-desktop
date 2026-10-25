@@ -1,11 +1,12 @@
 //! Desktop UI for the BitChat mesh node (egui), styled after the Android
-//! client's dark theme: message bubbles, peer colors, editable nickname.
+//! client's retro-terminal mesh theme: monospace type, black background,
+//! flat green (peers) / amber (self) containers.
 //!
 //! Usage:
 //!   cargo run -p bitchat-node --example node_gui
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,61 +17,62 @@ use eframe::egui;
 /// Key used for the mesh-wide channel in the log map.
 const CHANNEL_KEY: &str = "";
 
-// Dark theme lifted from the Android app (BitchatPalette / Theme.kt).
+// Retro-terminal palette (see docs/screenshots/readme-mesh-chat.png).
 const BG: egui::Color32 = egui::Color32::from_rgb(0x00, 0x00, 0x00);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0E, 0x15, 0x0E);
-const SURFACE_VARIANT: egui::Color32 = egui::Color32::from_rgb(0x18, 0x21, 0x18);
-const INPUT_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0B);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(0x32, 0xD7, 0x4B);
-const GREEN_CONTAINER: egui::Color32 = egui::Color32::from_rgb(0x16, 0x3D, 0x1D);
-const ON_GREEN_CONTAINER: egui::Color32 = egui::Color32::from_rgb(0xB8, 0xF5, 0xC1);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xF2, 0xE8);
-const TEXT_TERTIARY: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x77, 0x6B);
-const ORANGE: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x9F, 0x0A);
+const GREEN_CONTAINER: egui::Color32 = egui::Color32::from_rgb(0x14, 0x33, 0x1B);
+const GREEN_BORDER: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3A);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x9F, 0x0A);
+const AMBER_CONTAINER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x2A, 0x0E);
+const AMBER_BORDER: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x63, 0x1A);
+const BLUE: egui::Color32 = egui::Color32::from_rgb(0x0A, 0x84, 0xFF);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0xEA, 0xF2, 0xEA);
+const TEXT_TERTIARY: egui::Color32 = egui::Color32::from_rgb(0x8F, 0x9C, 0x8F);
+const INPUT_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0B);
+const INPUT_BORDER: egui::Color32 = egui::Color32::from_rgb(0x33, 0x36, 0x35);
+const ROW_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x10, 0x1D, 0x12);
 
-fn bitchat_visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = SURFACE;
+fn terminal_style(ctx: &egui::Context) {
+    use eframe::egui::{FontFamily, FontId, TextStyle};
+    let monospace = |size: f32| FontId::new(size, FontFamily::Monospace);
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Heading, monospace(18.0)),
+        (TextStyle::Body, monospace(14.5)),
+        (TextStyle::Small, monospace(11.5)),
+        (TextStyle::Button, monospace(13.5)),
+        (TextStyle::Monospace, monospace(14.5)),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    style.spacing.interact_size = egui::vec2(8.0, 32.0);
+    let visuals = &mut style.visuals;
+    visuals.panel_fill = BG;
     visuals.window_fill = BG;
     visuals.extreme_bg_color = INPUT_SURFACE;
-    visuals.faint_bg_color = SURFACE_VARIANT;
+    visuals.faint_bg_color = GREEN_CONTAINER;
     visuals.override_text_color = Some(TEXT);
+    visuals.hyperlink_color = BLUE;
     visuals.selection.bg_fill = GREEN_CONTAINER;
-    visuals.selection.stroke.color = ON_GREEN_CONTAINER;
-    visuals.widgets.noninteractive.bg_fill = SURFACE_VARIANT;
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
-    visuals.widgets.inactive.bg_fill = SURFACE_VARIANT;
-    visuals.widgets.hovered.bg_fill = GREEN_CONTAINER;
-    visuals.widgets.hovered.weak_bg_fill = GREEN_CONTAINER;
+    visuals.selection.stroke.color = GREEN;
+    visuals.widgets.noninteractive.bg_fill = GREEN_CONTAINER;
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(10);
+    visuals.widgets.inactive.bg_fill = GREEN_CONTAINER;
+    visuals.widgets.inactive.weak_bg_fill = GREEN_CONTAINER;
+    visuals.widgets.hovered.bg_fill = ROW_SELECTED;
+    visuals.widgets.hovered.weak_bg_fill = ROW_SELECTED;
     visuals.widgets.active.bg_fill = GREEN;
     visuals.widgets.active.fg_stroke.color = BG;
-    visuals.hyperlink_color = ORANGE;
-    visuals
+    ctx.set_style(style);
 }
 
-/// Stable per-peer color, the same idea as the app's `PeerColors`.
-fn peer_color(peer_id: &str) -> egui::Color32 {
-    let hue = u32::from_str_radix(&peer_id[..4], 16).unwrap_or(0) as f32 / 65535.0;
-    egui::epaint::Hsva {
-        h: hue,
-        s: 0.55,
-        v: 0.95,
-        a: 1.0,
-    }
-    .into()
-}
-
-fn now_hms() -> String {
+fn now_hm() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() % 86_400)
         .unwrap_or(0);
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
+    format!("{:02}:{:02}", (seconds / 3600) % 24, (seconds / 60) % 60)
 }
 
 enum UiCommand {
@@ -115,11 +117,11 @@ struct BitchatApp {
 }
 
 impl BitchatApp {
-    fn nickname_path(identity_path: &std::path::Path) -> PathBuf {
+    fn nickname_path(identity_path: &Path) -> PathBuf {
         identity_path.with_file_name("bitchatd.nickname")
     }
 
-    fn load_nickname(identity_path: &std::path::Path) -> String {
+    fn load_nickname(identity_path: &Path) -> String {
         if let Ok(nick) = std::env::var("BITCHATD_NICKNAME") {
             if !nick.trim().is_empty() {
                 return nick;
@@ -132,7 +134,7 @@ impl BitchatApp {
             .unwrap_or_else(|| "bitchatd".to_string())
     }
 
-    fn save_nickname(&self, identity_path: &std::path::Path) {
+    fn save_nickname(&self, identity_path: &Path) {
         let _ = std::fs::write(Self::nickname_path(identity_path), &self.nickname);
     }
 
@@ -158,7 +160,10 @@ impl BitchatApp {
             }
             LinkEvent::SessionEstablished { peer_id } => {
                 self.set_session(&peer_id, true);
-                self.status = format!("session chiffree etablie avec {peer_id}");
+                self.status = format!(
+                    "session chiffree etablie avec {}",
+                    self.nickname_of(&peer_id)
+                );
             }
             LinkEvent::PrivateMessage {
                 peer_id, content, ..
@@ -170,11 +175,8 @@ impl BitchatApp {
                 let nickname = self.nickname_of(&peer_id);
                 self.push_line(CHANNEL_KEY, &nickname, content);
             }
-            LinkEvent::Delivered {
-                peer_id,
-                message_id,
-            } => {
-                self.status = format!("delivre: {} -> {peer_id}", &message_id[..8]);
+            LinkEvent::Delivered { peer_id, .. } => {
+                self.status = format!("delivre a {} ✓", self.nickname_of(&peer_id));
             }
             LinkEvent::PeerDisconnected { peer_id } => {
                 self.set_session(&peer_id, false);
@@ -219,7 +221,7 @@ impl BitchatApp {
         self.logs.entry(key.to_string()).or_default().push(ChatLine {
             who: who.to_string(),
             text,
-            time: now_hms(),
+            time: now_hm(),
         });
     }
 
@@ -229,129 +231,131 @@ impl BitchatApp {
             return;
         }
         let selection = self.selected.clone();
+        let own_nick = self.nickname.clone();
         match selection {
             Selection::Broadcast => {
                 let _ = self
                     .cmd_out
                     .send(UiCommand::SendBroadcast { content: text.clone() });
-                self.push_line(CHANNEL_KEY, &self.nickname.clone(), text);
+                self.push_line(CHANNEL_KEY, &own_nick, text);
             }
             Selection::Peer(peer_id) => {
                 let _ = self.cmd_out.send(UiCommand::SendPrivate {
                     peer_id: peer_id.clone(),
                     content: text.clone(),
                 });
-                self.push_line(&peer_id, &self.nickname.clone(), text);
+                self.push_line(&peer_id, &own_nick, text);
             }
         }
         self.draft.clear();
     }
 
-    fn show_nickname_editor(&mut self, ui: &mut egui::Ui, identity_path: &std::path::Path) {
+    fn show_nickname_editor(&mut self, ui: &mut egui::Ui, identity_path: &Path) {
         if self.editing_nick {
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.nick_draft)
-                        .desired_width(140.0)
-                        .hint_text("pseudo"),
-                );
-                let enter = response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let apply = ui.button("✓").clicked() || enter;
-                if ui.button("✕").clicked() {
-                    self.editing_nick = false;
-                    self.nick_draft = self.nickname.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.nick_draft)
+                    .desired_width(170.0)
+                    .font(egui::TextStyle::Heading),
+            );
+            if ui.button("ok").clicked()
+                || (response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                let nickname = self.nick_draft.trim().to_string();
+                if !nickname.is_empty() {
+                    self.nickname = nickname.clone();
+                    self.save_nickname(identity_path);
+                    let _ = self.cmd_out.send(UiCommand::SetNickname { nickname });
                 }
-                if apply {
-                    let nickname = self.nick_draft.trim().to_string();
-                    if !nickname.is_empty() {
-                        self.nickname = nickname.clone();
-                        self.save_nickname(identity_path);
-                        let _ = self
-                            .cmd_out
-                            .send(UiCommand::SetNickname { nickname });
-                    }
-                    self.editing_nick = false;
-                }
-                response.request_focus();
-            });
-        } else {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&self.nickname)
-                        .strong()
-                        .color(ORANGE),
-                );
-                if ui
-                    .button(egui::RichText::new("✏").small())
-                    .on_hover_text("changer le pseudo")
-                    .clicked()
-                {
-                    self.editing_nick = true;
-                    self.nick_draft = self.nickname.clone();
-                }
-            });
+                self.editing_nick = false;
+            }
+        } else if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(format!("⣿ / @{}", self.nickname))
+                        .heading()
+                        .color(GREEN),
+                )
+                .fill(BG)
+                .corner_radius(6),
+            )
+            .on_hover_text("changer le pseudo")
+            .clicked()
+        {
+            self.editing_nick = true;
+            self.nick_draft = self.nickname.clone();
         }
     }
 
     fn show_peer_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         let channel_selected = self.selected == Selection::Broadcast;
-        let channel_title = "🌐 Canal commun".to_string();
-        if ui
-            .selectable_label(channel_selected, egui::RichText::new(&channel_title).strong())
-            .clicked()
-        {
+        let channel_row = egui::Frame::new()
+            .fill(if channel_selected { ROW_SELECTED } else { BG })
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} / {}",
+                        if channel_selected { ">" } else { " " },
+                        "canal commun"
+                    ))
+                    .color(if channel_selected { GREEN } else { TEXT }),
+                );
+            })
+            .response;
+        let channel_click = ui.interact(
+            channel_row.rect,
+            egui::Id::new("channel_row"),
+            egui::Sense::click(),
+        );
+        if channel_click.clicked() {
             self.selected = Selection::Broadcast;
         }
-        ui.separator();
+        ui.add_space(6.0);
         ui.label(egui::RichText::new("PEERS").small().color(TEXT_TERTIARY));
+        ui.separator();
+
         let mut pick: Option<Selection> = None;
         for peer in &self.peers {
-            let color = peer_color(&peer.peer_id);
             let selected = self.selected == Selection::Peer(peer.peer_id.clone());
-            let title = egui::RichText::new(format!("  {}", peer.nickname.chars().next().unwrap_or('?'))).color(BG).strong();
-            let response = ui.horizontal(|ui| {
-                let bubble = ui.add(
-                    egui::Label::new(title)
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
-                );
-                ui.painter().rect_filled(
-                    bubble.rect,
-                    egui::CornerRadius::same(10),
-                    color,
-                );
-                // Redraw text on top of the colored disc.
-                ui.painter().text(
-                    bubble.rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    peer.nickname.chars().next().unwrap_or('?').to_string(),
-                    egui::FontId::proportional(14.0),
-                    BG,
-                );
-                let label = egui::RichText::new(if peer.has_session {
-                    format!("{} 🔒", peer.nickname)
-                } else {
-                    peer.nickname.clone()
+            let cursor = if selected { ">" } else { " " };
+            let lock = if peer.has_session {
+                " [tls]"
+            } else if peer.verified {
+                " [sig]"
+            } else {
+                " [!]"
+            };
+            let row = egui::Frame::new()
+                .fill(if selected { ROW_SELECTED } else { BG })
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{cursor} @{}" , peer.nickname))
+                                .color(if selected { GREEN } else { TEXT }),
+                        );
+                        ui.label(
+                            egui::RichText::new(lock).small().color(TEXT_TERTIARY),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(format!("    {}", &peer.peer_id[..8]))
+                            .small()
+                            .color(TEXT_TERTIARY),
+                    );
                 })
-                .color(if selected { ON_GREEN_CONTAINER } else { TEXT });
-                ui.label(label);
-            });
-            let row = response.response;
-            if row.clicked() {
+                .response;
+            let click = ui.interact(
+                row.rect,
+                egui::Id::new(("peer_row", peer.peer_id.clone())),
+                egui::Sense::click(),
+            );
+            if click.clicked() {
                 pick = Some(Selection::Peer(peer.peer_id.clone()));
-            }
-            row.on_hover_text(format!(
-                "{}\nsignature verifiee: {}\nsession chiffree: {}",
-                peer.peer_id, peer.verified, peer.has_session
-            ));
-            if !peer.verified {
-                ui.label(
-                    egui::RichText::new("   signature non verifiee")
-                        .small()
-                        .color(TEXT_TERTIARY),
-                );
             }
         }
         if let Some(selection) = pick {
@@ -359,11 +363,7 @@ impl BitchatApp {
         }
     }
 
-    fn show_messages(&self, ui: &mut egui::Ui, key: &str, title: &str, subtitle: &str) {
-        ui.label(egui::RichText::new(title).heading().strong());
-        ui.label(egui::RichText::new(subtitle).small().color(TEXT_TERTIARY));
-        ui.add_space(4.0);
-        ui.separator();
+    fn show_messages(&self, ui: &mut egui::Ui, key: &str) {
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -371,62 +371,67 @@ impl BitchatApp {
                 let lines = self.logs.get(key).cloned().unwrap_or_default();
                 for line in &lines {
                     let own = line.who == self.nickname;
+                    let (fill, border, name_color, time_color) = if own {
+                        (
+                            AMBER_CONTAINER,
+                            AMBER_BORDER,
+                            AMBER,
+                            egui::Color32::from_rgb(0xC9, 0xA5, 0x5A),
+                        )
+                    } else {
+                        (
+                            GREEN_CONTAINER,
+                            GREEN_BORDER,
+                            GREEN,
+                            egui::Color32::from_rgb(0x8F, 0xC9, 0x98),
+                        )
+                    };
                     let align = if own {
                         egui::Layout::right_to_left(egui::Align::Min)
                     } else {
                         egui::Layout::left_to_right(egui::Align::Min)
                     };
                     ui.with_layout(align, |ui| {
-                        let (fill, text_color) = if own {
-                            (GREEN_CONTAINER, ON_GREEN_CONTAINER)
-                        } else {
-                            (SURFACE_VARIANT, TEXT)
-                        };
-                        let who_color = if own {
-                            ORANGE
-                        } else {
-                            peer_color_for_name(key, &line.who, &self.peers)
-                        };
                         egui::Frame::new()
                             .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, border))
                             .corner_radius(egui::CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{}  ", line.who))
-                                        .small()
-                                        .strong()
-                                        .color(who_color),
-                                );
-                                ui.label(egui::RichText::new(&line.text).color(text_color));
-                                ui.label(
-                                    egui::RichText::new(format!("  {}", line.time))
-                                        .small()
-                                        .color(TEXT_TERTIARY),
-                                );
+                                ui.set_max_width(520.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("@{}", line.who))
+                                            .strong()
+                                            .color(name_color),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&line.time)
+                                                    .small()
+                                                    .color(time_color),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(&line.text).color(TEXT));
                             });
-                        ui.add_space(2.0);
+                        ui.add_space(6.0);
                     });
                 }
                 if lines.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Aucun message pour le moment.")
-                            .color(TEXT_TERTIARY),
-                    );
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("-- aucun message --")
+                                .color(TEXT_TERTIARY),
+                        );
+                    });
                 }
             });
-    }
-}
-
-fn peer_color_for_name(key: &str, who: &str, peers: &[PeerInfo]) -> egui::Color32 {
-    let peer_id = peers
-        .iter()
-        .find(|peer| peer.nickname == who)
-        .map(|peer| peer.peer_id.as_str());
-    match peer_id {
-        Some(peer_id) => peer_color(peer_id),
-        None if key == CHANNEL_KEY => TEXT_TERTIARY,
-        None => TEXT,
     }
 }
 
@@ -441,74 +446,118 @@ impl eframe::App for BitchatApp {
             std::env::var("BITCHATD_IDENTITY").unwrap_or_else(|_| "bitchatd.identity".to_string()),
         );
 
+        // Terminal-style status bar: ⣿ / @nick   ·····   ⟨⟨ ⟩⟩ mesh   👥 n
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("bitchatd").strong().color(GREEN));
-                ui.separator();
                 self.show_nickname_editor(ui, &identity_path);
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!("peer {}", &self.our_id[..8]))
-                        .small()
-                        .color(TEXT_TERTIARY),
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("👥 {}", self.peers.len()))
+                            .heading()
+                            .color(BLUE),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("⟨(⟩ mesh").heading().color(BLUE),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!("#{}", &self.our_id[..8]))
+                            .small()
+                            .color(TEXT_TERTIARY),
+                    );
+                    ui.add_space(16.0);
+                });
             });
             ui.add_space(4.0);
+            ui.separator();
         });
 
         egui::SidePanel::left("peers")
             .resizable(true)
-            .default_width(230.0)
+            .default_width(250.0)
             .show(ctx, |ui| {
                 self.show_peer_list(ui);
             });
 
         egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.draft)
-                        .hint_text("Message…")
-                        .desired_width(f32::INFINITY),
-                );
+                let input = egui::TextEdit::singleline(&mut self.draft)
+                    .hint_text(
+                        egui::RichText::new("Type a message…").color(TEXT_TERTIARY),
+                    )
+                    .desired_width(f32::INFINITY)
+                    .min_size(egui::vec2(0.0, 34.0))
+                    .margin(egui::vec2(12.0, 9.0));
+                let response = egui::Frame::new()
+                    .fill(INPUT_SURFACE)
+                    .stroke(egui::Stroke::new(1.0, INPUT_BORDER))
+                    .corner_radius(20)
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| ui.add(input))
+                    .inner;
                 let enter = response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 let send = ui
-                    .add(egui::Button::new(egui::RichText::new("Envoyer").strong()).fill(GREEN))
+                    .add(
+                        egui::Button::new(egui::RichText::new("➤").size(17.0))
+                            .fill(GREEN)
+                            .corner_radius(20)
+                            .min_size(egui::vec2(46.0, 42.0)),
+                    )
                     .clicked();
                 if (send || enter) && !self.draft.trim().is_empty() {
                     self.send_draft();
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&self.status).small().color(TEXT_TERTIARY));
+                ui.label(
+                    egui::RichText::new(format!("# {}", self.status))
+                        .small()
+                        .color(TEXT_TERTIARY),
+                );
             });
+            ui.add_space(6.0);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let (key, title, subtitle) = match &self.selected {
                 Selection::Broadcast => (
                     CHANNEL_KEY.to_string(),
-                    "Canal commun".to_string(),
-                    "mesh-wide, non chiffre".to_string(),
+                    "canal commun".to_string(),
+                    "mesh-wide · non chiffre".to_string(),
                 ),
-                Selection::Peer(peer_id) => (
-                    peer_id.clone(),
-                    self.nickname_of(peer_id),
-                    if self
+                Selection::Peer(peer_id) => {
+                    let session = self
                         .peers
                         .iter()
-                        .any(|peer| peer.peer_id == *peer_id && peer.has_session)
-                    {
-                        format!("{} — session chiffree 🔒", peer_id)
-                    } else {
-                        format!("{peer_id} — pas de session")
-                    },
-                ),
+                        .any(|peer| peer.peer_id == *peer_id && peer.has_session);
+                    (
+                        peer_id.clone(),
+                        format!("@{}", self.nickname_of(peer_id)),
+                        if session {
+                            "session chiffree [tls]".to_string()
+                        } else {
+                            "en attente de session…".to_string()
+                        },
+                    )
+                }
             };
-            self.show_messages(ui, &key, &title, &subtitle);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).heading().color(GREEN));
+                ui.label(
+                    egui::RichText::new(format!("· {subtitle}"))
+                        .small()
+                        .color(TEXT_TERTIARY),
+                );
+            });
+            ui.separator();
+            ui.add_space(2.0);
+            self.show_messages(ui, &key);
         });
     }
 }
@@ -593,14 +642,16 @@ fn main() -> eframe::Result<()> {
         draft: String::new(),
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 680.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1160.0, 760.0])
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
         "bitchatd",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(bitchat_visuals());
+            terminal_style(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )
