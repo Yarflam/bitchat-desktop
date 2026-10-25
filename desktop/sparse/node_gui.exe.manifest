@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Side-by-side fusion manifest: connects node_gui.exe to the sparse
+     package identity (see sparse/AppxManifest.xml). Copied next to the
+     executable by run_node_gui.cmd. -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="0.0.0.0" name="bitchatd" />
+  <msix xmlns="urn:schemas-microsoft-com:msix.v1"
+        publisher="CN=bitchatd-dev"
+        packageName="Bitchatd.Desktop"
+        applicationId="NodeGui" />
+</assembly>

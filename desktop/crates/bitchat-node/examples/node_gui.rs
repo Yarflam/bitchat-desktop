@@ -149,6 +149,7 @@ struct BitchatApp {
     chat: HashMap<String, Vec<ChatLine>>,
     selected: Selection,
     draft: String,
+    start_signal: Option<std_mpsc::Sender<()>>,
 }
 
 const MAX_LOG_LINES: usize = 60;
@@ -513,6 +514,10 @@ impl BitchatApp {
 impl eframe::App for BitchatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_cursor_icon(egui::CursorIcon::Default);
+        if let Some(signal) = self.start_signal.take() {
+            // winit is fully initialized now; bring the mesh engine up.
+            let _ = signal.send(());
+        }
         while let Ok(event) = self.events_in.try_recv() {
             self.apply(event);
         }
@@ -645,11 +650,31 @@ fn main() -> eframe::Result<()> {
     let our_id = identity.peer_id.clone();
     eprintln!("bitchatd: peer_id={our_id} nickname={nickname}");
 
-    // Node engine on its own thread; UI talks to it over plain std channels.
+    #[cfg(windows)]
+    {
+        use windows::ApplicationModel::Package;
+        match Package::Current() {
+            Ok(package) => {
+                let id = package.Id().expect("package id");
+                eprintln!(
+                    "bitchatd: identity {} ({})",
+                    id.Name().expect("name"),
+                    id.Publisher().expect("publisher")
+                );
+            }
+            Err(error) => eprintln!("bitchatd: NO PACKAGE IDENTITY: {error}"),
+        }
+    }
+
+    // Node engine on its own thread, started lazily from the first UI frame
+    // (after winit finished initializing): starting the WinRT peripheral while
+    // winit is still initializing gets the publisher denied (E_ACCESSDENIED).
     let (event_tx, event_rx) = std_mpsc::channel::<LinkEvent>();
     let (cmd_tx, cmd_rx) = std_mpsc::channel::<UiCommand>();
     let node_nickname = nickname.clone();
+    let (start_tx, start_rx) = std_mpsc::channel::<()>();
     thread::spawn(move || {
+        let _ = start_rx.recv();
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         runtime.block_on(async move {
             let mut link = match MeshLink::start(identity, &node_nickname, 256).await {
@@ -726,6 +751,7 @@ fn main() -> eframe::Result<()> {
     let app = BitchatApp {
         events_in: event_rx,
         cmd_out: cmd_tx,
+        start_signal: Some(start_tx),
         our_id,
         nickname: nickname.clone(),
         nick_draft: nickname,
