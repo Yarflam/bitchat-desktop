@@ -1,3 +1,5 @@
 /target/
-# node identity files (private keys)
+# node runtime files (private keys, local config, legacy nickname)
 *.identity
+*.nickname
+bitchatd.toml

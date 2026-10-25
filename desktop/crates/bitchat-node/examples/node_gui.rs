@@ -11,7 +11,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitchat_node::{LinkEvent, MeshLink, NodeIdentity};
+use bitchat_node::{LinkEvent, MeshLink, NodeConfig, NodeIdentity};
 use eframe::egui;
 
 /// Key used for the mesh-wide channel in the log map.
@@ -239,25 +239,19 @@ fn settings_row(
 }
 
 impl BitchatApp {
-    fn nickname_path(identity_path: &Path) -> PathBuf {
-        identity_path.with_file_name("bitchatd.nickname")
-    }
-
     fn load_nickname(identity_path: &Path) -> String {
         if let Ok(nick) = std::env::var("BITCHATD_NICKNAME") {
             if !nick.trim().is_empty() {
                 return nick;
             }
         }
-        std::fs::read_to_string(Self::nickname_path(identity_path))
-            .map(|nick| nick.trim().to_string())
-            .ok()
-            .filter(|nick| !nick.is_empty())
-            .unwrap_or_else(|| "bitchatd".to_string())
+        NodeConfig::load(identity_path).nickname_or_default()
     }
 
     fn save_nickname(&self, identity_path: &Path) {
-        let _ = std::fs::write(Self::nickname_path(identity_path), &self.nickname);
+        let mut config = NodeConfig::load(identity_path);
+        config.node.nickname = Some(self.nickname.clone());
+        let _ = config.save(identity_path);
     }
 
     fn apply(&mut self, event: LinkEvent) {

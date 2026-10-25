@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use bitchat_node::link::LinkEvent;
-use bitchat_node::{MeshLink, NodeIdentity};
+use bitchat_node::{MeshLink, NodeConfig, NodeIdentity};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +21,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = PathBuf::from(
         std::env::var("BITCHATD_IDENTITY").unwrap_or_else(|_| "bitchatd.identity".to_string()),
     );
-    let nickname = std::env::var("BITCHATD_NICKNAME").unwrap_or_else(|_| "bitchatd".to_string());
+    let nickname = std::env::var("BITCHATD_NICKNAME")
+        .ok()
+        .filter(|nick| !nick.trim().is_empty())
+        .unwrap_or_else(|| {
+            let identity_path = std::path::PathBuf::from(
+                std::env::var("BITCHATD_IDENTITY")
+                    .unwrap_or_else(|_| "bitchatd.identity".to_string()),
+            );
+            NodeConfig::load(&identity_path).nickname_or_default()
+        });
 
     let identity = NodeIdentity::load_or_generate(&identity_path)?;
     println!(

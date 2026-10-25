@@ -6,9 +6,11 @@
 //! - [`link`]: session orchestration on top of the BLE central — announce,
 //!   Noise XX handshake (initiator and responder), encrypted private chat.
 
+pub mod config;
 pub mod identity;
 pub mod link;
 
+pub use config::NodeConfig;
 pub use identity::NodeIdentity;
 pub use link::{LinkCommand, LinkEvent, MeshLink};
 

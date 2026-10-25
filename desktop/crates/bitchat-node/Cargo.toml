@@ -8,9 +8,11 @@ license.workspace = true
 [dependencies]
 bitchat-ble = { path = "../bitchat-ble" }
 bitchat-wire = { path = "../bitchat-wire" }
+serde = { version = "1", features = ["derive"] }
 snow = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
