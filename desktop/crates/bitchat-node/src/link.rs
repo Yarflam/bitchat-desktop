@@ -115,6 +115,8 @@ pub enum LinkCommand {
     SendPrivateMessage { peer_id: String, content: String },
     /// Mesh-wide broadcast message.
     SendBroadcastMessage { content: String },
+    /// Change our nickname and re-announce to every route immediately.
+    SetNickname { nickname: String },
     /// Send a gossip sync request; `None` broadcasts to all neighbors.
     SendSyncRequest { target: Option<String> },
     Shutdown,
@@ -209,6 +211,16 @@ impl MeshLink {
             .map_err(|_| LinkError::Closed)
     }
 
+    /// Change our nickname; peers see it after the re-announcement.
+    pub async fn set_nickname(&self, nickname: &str) -> Result<(), LinkError> {
+        self.commands
+            .send(LinkCommand::SetNickname {
+                nickname: nickname.to_string(),
+            })
+            .await
+            .map_err(|_| LinkError::Closed)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.commands.send(LinkCommand::Shutdown).await;
     }
@@ -276,6 +288,17 @@ impl Actor {
                     }
                     Some(LinkCommand::SendBroadcastMessage { content }) => {
                         self.send_broadcast_message(&content).await;
+                    }
+                    Some(LinkCommand::SetNickname { nickname }) => {
+                        let nickname = nickname.trim();
+                        if !nickname.is_empty() && nickname != self.nickname {
+                            self.nickname = nickname.to_string();
+                            let routes: Vec<Route> = self.routes.values().cloned().collect();
+                            for route in routes {
+                                self.send_announce_to(&route).await;
+                            }
+                            self.info(format!("nickname changed to {nickname}; re-announced"));
+                        }
                     }
                     Some(LinkCommand::Shutdown) | None => break,
                 },
