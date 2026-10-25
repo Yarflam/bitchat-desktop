@@ -181,6 +181,9 @@ struct BitchatApp {
     /// Short grace period after the window regains focus during which no
     /// notification may fire, so a toast can never interrupt typing.
     notif_mute_until: Option<std::time::Instant>,
+    /// Desktop notifications are opt-in (BITCHATD_NOTIFY=1): Windows toasts
+    /// steal OS focus and would fight the composer while typing.
+    notifications_enabled: bool,
 }
 
 const MAX_LOG_LINES: usize = 60;
@@ -288,14 +291,18 @@ impl BitchatApp {
                 peer_id, content, ..
             } => {
                 let nickname = self.nickname_of(&peer_id);
-                self.pending_notifs
-                    .push((format!("@{} (private)", nickname), content.clone()));
+                if self.notifications_enabled {
+                    self.pending_notifs
+                        .push((format!("@{} (private)", nickname), content.clone()));
+                }
                 self.push_line(&peer_id, &nickname, content);
             }
             LinkEvent::BroadcastMessage { peer_id, content } => {
                 let nickname = self.nickname_of(&peer_id);
-                self.pending_notifs
-                    .push((format!("@{} (broadcast)", nickname), content.clone()));
+                if self.notifications_enabled {
+                    self.pending_notifs
+                        .push((format!("@{} (broadcast)", nickname), content.clone()));
+                }
                 self.push_line(CHANNEL_KEY, &nickname, content);
             }
             LinkEvent::Delivered { peer_id, .. } => {
@@ -1055,10 +1062,10 @@ impl eframe::App for BitchatApp {
         ctx.request_repaint_after(Duration::from_millis(300));
 
 
-        // Desktop notifications for incoming messages while unfocused.
-        // Toasts steal OS focus, so they are rate-limited (one collapsed toast
-        // per burst) and muted briefly after the window regains focus.
-        if !self.pending_notifs.is_empty() {
+        // Desktop notifications for incoming messages while unfocused (opt-in:
+        // toasts steal OS focus, so they are rate-limited and muted briefly
+        // after the window regains focus).
+        if self.notifications_enabled && !self.pending_notifs.is_empty() {
             let focused = ctx.input(|input| input.focused);
             let now = std::time::Instant::now();
             if focused {
@@ -1416,6 +1423,7 @@ fn main() -> eframe::Result<()> {
         scan: Vec::new(),
         last_notif: None,
         notif_mute_until: None,
+        notifications_enabled: std::env::var_os("BITCHATD_NOTIFY").is_some(),
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
