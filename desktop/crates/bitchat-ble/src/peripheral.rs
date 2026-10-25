@@ -265,12 +265,30 @@ mod imp {
             .map_err(|e| e.to_string())?;
 
         let publisher = BluetoothLEAdvertisementPublisher::Create(&advertisement)
-            .map_err(|e| format!("create publisher: {e}"))?;
-        publisher
-            .Start()
-            .map_err(|e| format!("start advertising: {e}"))?;
-        let _ = event_tx.send(PeripheralEvent::AdvertisingStarted);
-        let _publisher_alive = publisher;
+            .and_then(|publisher| publisher.Start().map(|_| publisher));
+        let _publisher_alive = match publisher {
+            Ok(publisher) => {
+                let _ = event_tx.send(PeripheralEvent::AdvertisingStarted);
+                Some(publisher)
+            }
+            Err(error) => {
+                // The advertisement publisher requires package identity with
+                // the bluetooth capability, which unpackaged desktop processes
+                // lack (E_ACCESSDENIED). Fall back to the service provider's
+                // built-in advertisement: it only carries the bare service
+                // UUID (no peer ID service data), so scanners recognize the
+                // service but cannot identify us until we connect out.
+                let _ = event_tx.send(PeripheralEvent::Info(format!(
+                    "custom advertisement unavailable ({error}); \
+                     advertising service UUID only"
+                )));
+                provider
+                    .StartAdvertising()
+                    .map_err(|e| format!("start advertising: {e}"))?;
+                let _ = event_tx.send(PeripheralEvent::AdvertisingStarted);
+                None
+            }
+        };
 
         // Command loop: this thread owns the WinRT objects for their lifetime.
         while let Ok(command) = cmd_rx.recv() {
