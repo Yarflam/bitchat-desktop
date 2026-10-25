@@ -153,6 +153,15 @@ The node implements the same GATT profile as Android:
   data; treat as candidate peer. This matches Android scanning behavior.
 - Active: after connecting, exchange signed ANNOUNCE (gossip TLV `0x04` gives
   a topology view of the neighborhood).
+- Gossip sync (REQUEST_SYNC `0x21`): the node participates in the deployed
+  GCS-based announcement gossip (`GCSFilter.kt`, `GossipSyncManager.kt`):
+  deterministic packet IDs (`SHA-256(type|sender|timestamp|payload)[..16]`),
+  Golomb-Rice filters (P from FPR 1%, M = N·2^P), sync requests neighbor-only
+  (TTL 0) every 30 s plus one targeted request 5 s after a peer's first
+  verified announce, and responses relay the originator-signed packets the
+  requester is missing (announcements first, 20 ms pacing). Relay of ANNOUNCE
+  and broadcast MESSAGE packets decrements TTL after a validPacket gate and
+  a 10 000-entry seen cache, mirroring `PacketProcessor`.
 - Optional LAN extension (not required for v1): mDNS advertisement carrying
   the same service UUID + peer ID, TCP transport carrying the same framed
   packets. Wi-Fi Aware is NOT available on desktop hardware and is replaced,

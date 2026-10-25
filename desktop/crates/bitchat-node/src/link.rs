@@ -2,17 +2,19 @@
 //! Noise sessions, and exchanges private messages — byte-compatible with the
 //! Android client's mesh orchestration (`MeshCore`, `MessageHandler`).
 
-use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitchat_ble::central::{CentralCommand, CentralEventOut, CentralHandle};
 #[cfg(windows)]
 use bitchat_ble::peripheral::{PeripheralCommand, PeripheralEvent, PeripheralHandle};
 use bitchat_ble::PeripheralId;
 use bitchat_wire::announce::IdentityAnnouncement;
+use bitchat_wire::gcs;
 use bitchat_wire::identity::verify_packet;
 use bitchat_wire::noise::{derive_peer_id, NoiseSession};
 use bitchat_wire::noise_payload::{NoisePayload, NoisePayloadType, PrivateMessagePacket};
+use bitchat_wire::sync::RequestSyncPacket;
 use bitchat_wire::{MessageType, Packet};
 use tokio::sync::mpsc;
 
@@ -34,6 +36,16 @@ impl Route {
 
 /// Default TTL used by the Android client for regular packets.
 const MAX_TTL: u8 = 7;
+/// Sync packets stay neighbor-only, mirror of `AppConstants.SYNC_TTL_HOPS`.
+const SYNC_TTL: u8 = 0;
+/// Announcements older than this are pruned from the gossip store, mirror of
+/// `AppConstants.Mesh.STALE_PEER_TIMEOUT_MS`.
+const STALE_ANNOUNCE_MS: u64 = 180_000;
+/// Initial targeted sync delay after a peer's first verified announce,
+/// mirror of `GossipSyncManager.scheduleInitialSyncToPeer`.
+const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(5);
+/// Periodic sync broadcast period (`GossipSyncManager.start`).
+const SYNC_PERIOD: Duration = Duration::from_secs(30);
 /// Drop a session after this many consecutive decrypt failures, like the
 /// Android client does before re-handshaking.
 const MAX_DECRYPT_FAILURES: u32 = 3;
@@ -87,6 +99,11 @@ pub enum LinkEvent {
     PeerDisconnected {
         peer_id: String,
     },
+    /// A broadcast (mesh-wide) message from a peer.
+    BroadcastMessage {
+        peer_id: String,
+        content: String,
+    },
     Info(String),
 }
 
@@ -94,6 +111,8 @@ pub enum LinkEvent {
 #[derive(Debug)]
 pub enum LinkCommand {
     SendPrivateMessage { peer_id: String, content: String },
+    /// Send a gossip sync request; `None` broadcasts to all neighbors.
+    SendSyncRequest { target: Option<String> },
     Shutdown,
 }
 
@@ -130,10 +149,11 @@ impl MeshLink {
             identity,
             nickname: nickname.to_string(),
             central_events,
-            central_commands,
+            central_commands: central_commands.clone(),
             peripheral,
             peripheral_events,
             commands: command_rx,
+            internal_tx: command_tx.clone(),
             events: event_tx,
             sessions: HashMap::new(),
             routes: HashMap::new(),
@@ -142,6 +162,16 @@ impl MeshLink {
             pending: HashMap::new(),
             decrypt_failures: HashMap::new(),
             connecting: HashSet::new(),
+            gossip_announcements: HashMap::new(),
+            gossip_announcement_order: VecDeque::new(),
+            gossip_messages: VecDeque::new(),
+            seen_packet_ids: HashSet::new(),
+            seen_packet_order: VecDeque::new(),
+            initial_sync_scheduled: HashSet::new(),
+            sync_tick: tokio::time::interval_at(
+                tokio::time::Instant::now() + SYNC_PERIOD,
+                SYNC_PERIOD,
+            ),
         };
         tokio::spawn(async move { actor.run().await });
 
@@ -181,6 +211,8 @@ struct Actor {
     /// the select! branch stays structurally alive.
     peripheral_events: mpsc::Receiver<PeripheralEvent>,
     commands: mpsc::Receiver<LinkCommand>,
+    /// Clone of the public command sender, used to schedule internal timers.
+    internal_tx: mpsc::Sender<LinkCommand>,
     events: mpsc::Sender<LinkEvent>,
     /// Wire peer ID -> Noise session.
     sessions: HashMap<String, NoiseSession>,
@@ -194,6 +226,19 @@ struct Actor {
     pending: HashMap<String, Vec<(String, String)>>,
     decrypt_failures: HashMap<String, u32>,
     connecting: HashSet<PeripheralId>,
+    /// Gossip store: latest announcement per sender peer ID.
+    gossip_announcements: HashMap<String, ([u8; 16], Packet)>,
+    /// Insertion order of `gossip_announcements` for capacity eviction.
+    gossip_announcement_order: VecDeque<String>,
+    /// Broadcast messages in insertion order (capped, deduped by packet ID).
+    gossip_messages: VecDeque<([u8; 16], Packet)>,
+    /// Packet IDs already seen/handled (loop prevention), and their order.
+    seen_packet_ids: HashSet<[u8; 16]>,
+    seen_packet_order: VecDeque<[u8; 16]>,
+    /// Peers for which the initial targeted sync has been scheduled.
+    initial_sync_scheduled: HashSet<String>,
+    /// Periodic gossip sync broadcast.
+    sync_tick: tokio::time::Interval,
 }
 
 impl Actor {
@@ -212,7 +257,14 @@ impl Actor {
                     Some(LinkCommand::SendPrivateMessage { peer_id, content }) => {
                         self.send_private_message(&peer_id, &content).await;
                     }
+                    Some(LinkCommand::SendSyncRequest { target }) => {
+                        self.send_request_sync(target).await;
+                    }
                     Some(LinkCommand::Shutdown) | None => break,
+                },
+                _ = self.sync_tick.tick() => {
+                    self.prune_stale_gossip();
+                    self.send_request_sync(None).await;
                 },
             }
         }
@@ -375,7 +427,9 @@ impl Actor {
         };
 
         match message_type {
-            MessageType::Announce => self.handle_announce(sender.to_string(), &packet).await,
+            MessageType::Announce => self.handle_announce(sender.to_string(), packet, via).await,
+            MessageType::Message => self.handle_broadcast_message(sender, packet, via).await,
+            MessageType::RequestSync => self.handle_request_sync(sender, &packet),
             MessageType::NoiseHandshake => self.handle_noise_handshake(sender, packet, via).await,
             MessageType::NoiseEncrypted => self.handle_noise_encrypted(sender, packet).await,
             other => self.info(format!(
@@ -384,7 +438,32 @@ impl Actor {
         }
     }
 
-    async fn handle_announce(&mut self, sender: String, packet: &Packet) {
+    /// Record a public packet ID in the seen cache (loop prevention),
+    /// returning `false` when the packet was already seen.
+    fn mark_seen(&mut self, id: [u8; 16]) -> bool {
+        if !self.seen_packet_ids.insert(id) {
+            return false;
+        }
+        self.seen_packet_order.push_back(id);
+        while self.seen_packet_order.len() > gcs::DEDUP_CAPACITY {
+            if let Some(evicted) = self.seen_packet_order.pop_front() {
+                self.seen_packet_ids.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    /// Deterministic sync ID for a public packet (`PacketIdUtil`).
+    fn packet_sync_id(packet: &Packet) -> [u8; 16] {
+        gcs::packet_id(
+            packet.packet_type,
+            &packet.sender_id,
+            packet.timestamp,
+            &packet.payload,
+        )
+    }
+
+    async fn handle_announce(&mut self, sender: String, packet: Packet, via: Route) {
         let Some(announce) = IdentityAnnouncement::decode(&packet.payload) else {
             self.info(format!("undecodable ANNOUNCE from {sender}"));
             return;
@@ -410,16 +489,312 @@ impl Actor {
         let is_verified = packet
             .signature
             .as_ref()
-            .map(|_| verify_packet(packet, &signing_key))
+            .map(|_| verify_packet(&packet, &signing_key))
             .unwrap_or(false);
         self.peers.insert(sender.clone(), announce.clone());
         self.verified.insert(sender.clone(), is_verified);
+
+        if is_verified {
+            // Gossip: only verified announcements enter the sync store and
+            // get relayed, mirroring the phone's validPacket gate.
+            let id = Self::packet_sync_id(&packet);
+            if self.mark_seen(id) {
+                self.store_announcement(&sender, id, packet.clone());
+                self.relay_public_packet(&packet, &via);
+            }
+            self.schedule_initial_sync(&sender);
+        }
+
         let _ = self.events.try_send(LinkEvent::PeerAnnounced {
             peer_id: sender.clone(),
             nickname: announce.nickname.clone(),
             verified: is_verified,
             capabilities: announce.capabilities.map(|c| c.0 as u16),
         });
+    }
+
+    /// Insert an announcement into the gossip store, evicting the oldest
+    /// entry when over capacity (`GossipSyncManager.onPublicPacketSeen`).
+    fn store_announcement(&mut self, sender: &str, id: [u8; 16], packet: Packet) {
+        if self.gossip_announcements.contains_key(sender) {
+            self.gossip_announcements
+                .insert(sender.to_string(), (id, packet));
+            return;
+        }
+        while self.gossip_announcements.len() >= gcs::SEEN_CAPACITY {
+            let Some(oldest) = self.gossip_announcement_order.pop_front() else {
+                break;
+            };
+            self.gossip_announcements.remove(&oldest);
+        }
+        self.gossip_announcement_order.push_back(sender.to_string());
+        self.gossip_announcements
+            .insert(sender.to_string(), (id, packet));
+    }
+
+    /// Schedule the one-shot targeted sync sent shortly after a peer first
+    /// announces itself (`GossipSyncManager.scheduleInitialSyncToPeer`).
+    fn schedule_initial_sync(&mut self, peer_id: &str) {
+        if !self.initial_sync_scheduled.insert(peer_id.to_string()) {
+            return;
+        }
+        let tx = self.internal_tx.clone();
+        let peer = peer_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(INITIAL_SYNC_DELAY).await;
+            let _ = tx
+                .send(LinkCommand::SendSyncRequest {
+                    target: Some(peer),
+                })
+                .await;
+        });
+    }
+
+    /// Handle a broadcast mesh message: store, surface, and relay.
+    async fn handle_broadcast_message(&mut self, sender: &str, packet: Packet, via: Route) {
+        let is_broadcast = packet.recipient_id.is_none();
+        if !is_broadcast {
+            // Directed messages ride Noise; unexpected on the clear channel.
+            self.info(format!("ignoring directed MESSAGE from {sender}"));
+            return;
+        }
+        // Relay/storage requires a signature that verifies against the
+        // sender's announced key, mirroring the phone's validPacket gate.
+        let Some(announce) = self.peers.get(sender) else {
+            return;
+        };
+        let Ok(signing_key) = announce.signing_public_key.clone().try_into() else {
+            return;
+        };
+        if self.verified.get(sender) != Some(&true) || !verify_packet(&packet, &signing_key) {
+            return;
+        }
+        let id = Self::packet_sync_id(&packet);
+        if !self.mark_seen(id) {
+            return;
+        }
+        self.store_broadcast_message(id, packet.clone());
+        let content = decode_message_content(&packet.payload);
+        let _ = self.events.try_send(LinkEvent::BroadcastMessage {
+            peer_id: sender.to_string(),
+            content,
+        });
+        self.relay_public_packet(&packet, &via);
+    }
+
+    fn store_broadcast_message(&mut self, id: [u8; 16], packet: Packet) {
+        while self.gossip_messages.len() >= gcs::SEEN_CAPACITY {
+            self.gossip_messages.pop_front();
+        }
+        self.gossip_messages.push_back((id, packet));
+    }
+
+    /// Drop announcements (and their messages) older than the stale timeout.
+    fn prune_stale_gossip(&mut self) {
+        let now = now_ms();
+        let stale: Vec<String> = self
+            .gossip_announcements
+            .iter()
+            .filter(|(_, (_, packet))| now.saturating_sub(packet.timestamp) > STALE_ANNOUNCE_MS)
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in &stale {
+            self.gossip_announcements.remove(peer);
+        }
+        if stale.is_empty() {
+            return;
+        }
+        self.gossip_announcement_order
+            .retain(|peer| !stale.contains(peer));
+        let stale_senders: HashSet<String> = stale.into_iter().collect();
+        self.gossip_messages
+            .retain(|(_, packet)| !stale_senders.contains(&hex(&packet.sender_id)));
+    }
+
+    /// Respond to a REQUEST_SYNC by sending the packets the requester is
+    /// missing, announcements first (`GossipSyncManager.handleRequestSync`).
+    fn handle_request_sync(&mut self, sender: &str, packet: &Packet) {
+        let Some(request) = RequestSyncPacket::decode(&packet.payload) else {
+            self.info(format!("undecodable REQUEST_SYNC from {sender}"));
+            return;
+        };
+        let m = u64::from(request.m);
+        let sorted = gcs::decode_to_sorted_set(request.p, m, &request.data);
+        let might_contain = |id: &[u8; 16]| {
+            let v = gcs::h64(id) % m;
+            let v = if v == 0 { 1 } else { v };
+            gcs::contains(&sorted, v)
+        };
+
+        let (offered, _) = self.build_sync_snapshot();
+        let mut missing: Vec<([u8; 16], Packet)> = offered
+            .into_iter()
+            .filter(|(id, _)| !might_contain(id))
+            .collect();
+        missing.sort_by(|a, b| {
+            let rank = |packet: &Packet| {
+                if packet.packet_type == MessageType::Announce as u8 {
+                    0
+                } else {
+                    1
+                }
+            };
+            rank(&a.1)
+                .cmp(&rank(&b.1))
+                .then(a.1.timestamp.cmp(&b.1.timestamp))
+                .then(a.0.cmp(&b.0))
+        });
+        if missing.is_empty() {
+            return;
+        }
+        let Some(route) = self.routes.get(sender).cloned() else {
+            return;
+        };
+        if route.is_empty() {
+            return;
+        }
+        self.info(format!(
+            "sync: offering {} packet(s) to {sender}",
+            missing.len()
+        ));
+
+        // The packets are already signed by their originators; relay them
+        // verbatim with the neighbor-only TTL, paced like the phone client.
+        let central_tx = self.central_commands.clone();
+        #[cfg(windows)]
+        let peripheral = self.peripheral.clone();
+        tokio::spawn(async move {
+            for (index, (_, mut packet)) in missing.into_iter().enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                packet.ttl = SYNC_TTL;
+                if let Some(id) = &route.central {
+                    let _ = central_tx
+                        .send(CentralCommand::Send {
+                            id: id.clone(),
+                            packet: packet.clone(),
+                        })
+                        .await;
+                }
+                #[cfg(windows)]
+                if let (Some(session), Some(handle)) = (&route.peripheral, &peripheral) {
+                    let _ = handle.send(PeripheralCommand::Send {
+                        session: session.clone(),
+                        packet,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Build the advertised/offered sync window, mirror of
+    /// `GossipSyncManager.buildSyncSnapshot` (dependency closure included).
+    fn build_sync_snapshot(&self) -> (Vec<([u8; 16], Packet)>, gcs::GcsParams) {
+        let mut candidates: Vec<([u8; 16], Packet)> =
+            self.gossip_announcements.values().cloned().collect();
+        candidates.extend(self.gossip_messages.iter().cloned());
+        candidates.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp).then(a.0.cmp(&b.0)));
+
+        let limit = gcs::SEEN_CAPACITY
+            .max(1)
+            .min(gcs::estimate_max_elements_for_size(
+                gcs::DEFAULT_FILTER_BYTES,
+                gcs::derive_p(gcs::DEFAULT_FPR),
+            ));
+        let mut selected: Vec<([u8; 16], Packet)> = Vec::new();
+        let mut have: HashSet<[u8; 16]> = HashSet::new();
+        for (id, packet) in &candidates {
+            if have.contains(id) {
+                continue;
+            }
+            let dependency: Option<([u8; 16], Packet)> =
+                if packet.packet_type == MessageType::Message as u8 {
+                    let sender = hex(&packet.sender_id);
+                    self.gossip_announcements
+                        .get(&sender)
+                        .filter(|(announcement_id, _)| !have.contains(announcement_id))
+                        .cloned()
+                } else {
+                    None
+                };
+            let required = if dependency.is_some() { 2 } else { 1 };
+            if have.len() + required > limit {
+                continue;
+            }
+            if let Some(dep) = dependency {
+                have.insert(dep.0);
+                selected.push(dep);
+            }
+            have.insert(*id);
+            selected.push((id.to_owned(), packet.clone()));
+        }
+
+        let filter = gcs::build_filter(
+            &selected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            gcs::DEFAULT_FILTER_BYTES,
+            gcs::DEFAULT_FPR,
+        );
+        let encoded_count = ((filter.m >> filter.p) as usize).min(selected.len());
+        selected.truncate(encoded_count);
+        (selected, filter)
+    }
+
+    /// Broadcast (or targeted) gossip sync request, signed like any other
+    /// packet we originate (`GossipSyncManager.sendRequestSync`).
+    async fn send_request_sync(&mut self, target: Option<String>) {
+        let (_, filter) = self.build_sync_snapshot();
+        let payload = RequestSyncPacket::new(
+            filter.p,
+            filter.m.max(1).min(u64::from(u32::MAX)) as u32,
+            filter.data,
+        )
+        .encode();
+        let mut packet = Packet::new(
+            MessageType::RequestSync as u8,
+            SYNC_TTL,
+            self.identity.peer_id_bytes(),
+            payload,
+        );
+        packet.timestamp = now_ms();
+        packet.recipient_id = target.as_deref().and_then(peer_bytes);
+
+        match target {
+            Some(peer) => {
+                let Some(route) = self.routes.get(&peer).cloned() else {
+                    return;
+                };
+                if route.is_empty() {
+                    return;
+                }
+                self.sign_and_send(&route, packet);
+            }
+            None => {
+                let routes: Vec<Route> = self.routes.values().cloned().collect();
+                for route in routes {
+                    self.sign_and_send(&route, packet.clone());
+                }
+            }
+        }
+    }
+
+    /// Relay a valid public packet to every route except the arrival channel,
+    /// with TTL decremented (the phone's `validPacket` relay gate).
+    fn relay_public_packet(&self, packet: &Packet, via: &Route) {
+        if packet.ttl == 0 {
+            return;
+        }
+        let mut relayed = packet.clone();
+        relayed.ttl = packet.ttl - 1;
+        for route in self.routes.values() {
+            let same_central = matches!(&route.central, Some(a) if via.central.as_ref() == Some(a));
+            let same_peripheral =
+                matches!(&route.peripheral, Some(a) if via.peripheral.as_ref() == Some(a));
+            if same_central || same_peripheral {
+                continue; // don't send back on the arrival channel
+            }
+            self.send_frame(route, &relayed);
+        }
     }
 
     async fn handle_noise_handshake(&mut self, sender: &str, packet: Packet, via: Route) {
@@ -766,6 +1141,12 @@ impl Actor {
                 );
             }
         }
+        self.send_frame(route, &packet);
+    }
+
+    /// Write an already-signed packet to every channel of a route. Relays and
+    /// sync responses keep the originator's signature untouched.
+    fn send_frame(&self, route: &Route, packet: &Packet) {
         if let Some(peripheral) = &route.central {
             let _ = self.central_commands.try_send(CentralCommand::Send {
                 id: peripheral.clone(),
@@ -776,10 +1157,29 @@ impl Actor {
         if let (Some(peripheral), Some(handle)) = (&route.peripheral, &self.peripheral) {
             let _ = handle.send(PeripheralCommand::Send {
                 session: peripheral.clone(),
-                packet,
+                packet: packet.clone(),
             });
         }
     }
+}
+
+/// Best-effort content extraction for a broadcast MESSAGE payload: TLV
+/// `0x01` holds the UTF-8 text; unknown TLVs are skipped.
+fn decode_message_content(payload: &[u8]) -> String {
+    let mut offset = 0usize;
+    while offset + 2 <= payload.len() {
+        let tlv_type = payload[offset];
+        let length = usize::from(payload[offset + 1]);
+        offset += 2;
+        if offset + length > payload.len() {
+            break;
+        }
+        if tlv_type == 0x01 {
+            return String::from_utf8_lossy(&payload[offset..offset + length]).into_owned();
+        }
+        offset += length;
+    }
+    String::new()
 }
 
 /// Start the GATT server on Windows; a never-fed event stream elsewhere.

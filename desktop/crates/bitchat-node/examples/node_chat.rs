@@ -69,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     println!("[chat    ] delivered ack from {peer_id} for {message_id}")
                 }
+                LinkEvent::BroadcastMessage { peer_id, content } => {
+                    println!("[chat    ] broadcast from {peer_id}: {content}")
+                }
                 LinkEvent::PeerDisconnected { peer_id } => {
                     println!("[link    ] {peer_id} disconnected")
                 }

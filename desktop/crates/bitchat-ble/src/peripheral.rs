@@ -65,6 +65,7 @@ mod imp {
     }
 
     /// Async handle for a running peripheral node (Windows only).
+    #[derive(Clone)]
     pub struct PeripheralHandle {
         commands: std::sync::mpsc::Sender<PeripheralCommand>,
     }
