@@ -9,11 +9,13 @@ use bitchat_ble::central::{CentralCommand, CentralEventOut, CentralHandle};
 #[cfg(windows)]
 use bitchat_ble::peripheral::{PeripheralCommand, PeripheralEvent, PeripheralHandle};
 use bitchat_ble::PeripheralId;
-use bitchat_wire::announce::IdentityAnnouncement;
+use bitchat_wire::announce::{IdentityAnnouncement, PeerCapabilities};
 use bitchat_wire::gcs;
 use bitchat_wire::identity::verify_packet;
 use bitchat_wire::noise::{derive_peer_id, NoiseSession};
-use bitchat_wire::noise_payload::{NoisePayload, NoisePayloadType, PrivateMessagePacket};
+use bitchat_wire::noise_payload::{
+    AuthenticatedPeerState, NoisePayload, NoisePayloadType, PrivateMessagePacket,
+};
 use bitchat_wire::sync::RequestSyncPacket;
 use bitchat_wire::{MessageType, Packet};
 use tokio::sync::mpsc;
@@ -98,6 +100,16 @@ pub enum LinkEvent {
         peer_id: String,
         message_id: String,
     },
+    /// We sent our AuthenticatedPeerState right after session establishment.
+    PeerStateSent {
+        peer_id: String,
+    },
+    /// AuthenticatedPeerState received from a peer.
+    PeerState {
+        peer_id: String,
+        capabilities: u64,
+        signing_public_key: String,
+    },
     PeerDisconnected {
         peer_id: String,
     },
@@ -167,6 +179,7 @@ impl MeshLink {
             verified: HashMap::new(),
             pending: HashMap::new(),
             decrypt_failures: HashMap::new(),
+            peerstate_sent: HashSet::new(),
             connecting: HashSet::new(),
             gossip_announcements: HashMap::new(),
             gossip_announcement_order: VecDeque::new(),
@@ -251,6 +264,9 @@ struct Actor {
     /// Messages queued while a handshake is in flight.
     pending: HashMap<String, Vec<(String, String)>>,
     decrypt_failures: HashMap<String, u32>,
+    /// Peers that already received our AuthenticatedPeerState for the current
+    /// Noise session generation; re-handshake clears the entry so we resend.
+    peerstate_sent: HashSet<String>,
     connecting: HashSet<PeripheralId>,
     /// Gossip store: latest announcement per sender peer ID.
     gossip_announcements: HashMap<String, ([u8; 16], Packet)>,
@@ -913,6 +929,7 @@ impl Actor {
             };
         match session.process_handshake_message(payload) {
             Ok(Some(response)) => {
+                self.peerstate_sent.remove(sender);
                 self.sessions.insert(sender.to_string(), session);
                 self.routes
                     .entry(sender.to_string())
@@ -920,6 +937,7 @@ impl Actor {
                 Feed::Response(response)
             }
             Ok(None) => {
+                self.peerstate_sent.remove(sender);
                 self.sessions.insert(sender.to_string(), session);
                 self.routes
                     .entry(sender.to_string())
@@ -946,6 +964,12 @@ impl Actor {
         let _ = self.events.try_send(LinkEvent::SessionEstablished {
             peer_id: peer.to_string(),
         });
+        // Mirror the phone client: authenticate the session by sending our
+        // PeerState as the first encrypted message. This unlocks the peer's
+        // UI/session so it can reply without waiting for an inbound message.
+        if !self.peerstate_sent.contains(peer) {
+            self.send_peer_state(peer);
+        }
         let pending = self.pending.remove(peer).unwrap_or_default();
         for (message_id, content) in pending {
             self.deliver_private(peer, &message_id, &content);
@@ -1022,6 +1046,25 @@ impl Actor {
                             peer_id: sender.to_string(),
                             message_id,
                         });
+                    }
+                    NoisePayloadType::PeerState => {
+                        match AuthenticatedPeerState::decode(&payload.data) {
+                            Some(state) => {
+                                // Echo our own state for this generation if we
+                                // have not sent it yet (phone-parity behaviour).
+                                if !self.peerstate_sent.contains(sender) {
+                                    self.send_peer_state(sender);
+                                }
+                                let _ = self.events.try_send(LinkEvent::PeerState {
+                                    peer_id: sender.to_string(),
+                                    capabilities: state.capabilities.0,
+                                    signing_public_key: to_hex(&state.signing_public_key),
+                                });
+                            }
+                            None => {
+                                self.info(format!("undecodable peer state from {sender}"))
+                            }
+                        }
                     }
                     other => self.info(format!("noise payload {other:?} from {sender} ignored")),
                 }
@@ -1104,6 +1147,50 @@ impl Actor {
         self.sign_and_send(&route, packet);
     }
 
+    /// Encrypt and send our AuthenticatedPeerState (Noise payload 0x21) to a
+    /// peer with an established session, mirroring the phone client's
+    /// post-authentication announcement. Marks the generation as sent.
+    fn send_peer_state(&mut self, peer_id: &str) {
+        let Some(route) = self.routes.get(peer_id).cloned() else {
+            return;
+        };
+        if route.is_empty() {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(peer_id) else {
+            return;
+        };
+        if !session.is_established() {
+            return;
+        }
+        let state = AuthenticatedPeerState::new(
+            PeerCapabilities(ADVERTISED_CAPABILITIES),
+            self.identity.signing.public_key(),
+        );
+        let envelope = NoisePayload::new(NoisePayloadType::PeerState, state.encode()).encode();
+        let ciphertext = match session.encrypt(&envelope) {
+            Ok(ciphertext) => ciphertext,
+            Err(e) => {
+                self.info(format!("peer state encrypt for {peer_id}: {e}"));
+                return;
+            }
+        };
+        let mut packet = Packet::new(
+            MessageType::NoiseEncrypted as u8,
+            MAX_TTL,
+            self.identity.peer_id_bytes(),
+            ciphertext,
+        );
+        packet.recipient_id = peer_bytes(peer_id);
+        packet.timestamp = now_ms();
+        self.sign_and_send(&route, packet);
+        self.peerstate_sent.insert(peer_id.to_string());
+        self.info(format!("[peerstate] sent to {peer_id}"));
+        let _ = self.events.try_send(LinkEvent::PeerStateSent {
+            peer_id: peer_id.to_string(),
+        });
+    }
+
     /// Encrypt and send a Delivered ack for a received private message,
     /// mirroring the phone client's automatic acknowledgement.
     fn deliver_delivered(&mut self, peer_id: &str, message_id: &str) {
@@ -1162,6 +1249,7 @@ impl Actor {
             };
         match session.start_handshake() {
             Ok(message) => {
+                self.peerstate_sent.remove(peer_id);
                 self.sessions.insert(peer_id.to_string(), session);
                 self.send_handshake_packet(&route, peer_id, message).await;
             }

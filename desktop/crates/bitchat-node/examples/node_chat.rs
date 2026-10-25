@@ -76,6 +76,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     println!("[chat    ] delivered ack from {peer_id} for {message_id}")
                 }
+                LinkEvent::PeerStateSent { peer_id } => {
+                    println!("[peerstate] sent to {peer_id}");
+                }
+                LinkEvent::PeerState {
+                    peer_id,
+                    capabilities,
+                    signing_public_key,
+                } => println!(
+                    "[peerstate] from {peer_id} caps={capabilities:#x} key={signing_public_key}"
+                ),
                 LinkEvent::BroadcastMessage { peer_id, content } => {
                     println!("[chat    ] broadcast from {peer_id}: {content}")
                 }

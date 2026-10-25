@@ -1,6 +1,8 @@
 //! Noise payload envelope and private message TLV encoding.
 //! Byte-exact port of `NoiseEncrypted.kt` (iOS-compatible).
 
+use crate::announce::PeerCapabilities;
+
 /// Payload types embedded within NOISE_ENCRYPTED messages.
 /// Matches iOS `NoisePayloadType` exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +17,93 @@ pub enum NoisePayloadType {
     FileTransfer = 0x20,
     /// Authenticated capabilities + Ed25519 binding for the current Noise generation.
     PeerState = 0x21,
+}
+
+/// Canonical payload carried inside Noise payload type 0x21, mirroring
+/// `AuthenticatedPeerState.kt`. Sent automatically once the Noise session
+/// authenticates (and echoed on receipt) so both peers can start exchanging
+/// encrypted traffic immediately.
+///
+/// Wire format:
+/// `[version=0x01][type=0x01][len=1..8][minimal LE capabilities]`
+/// `[type=0x02][len=32][Ed25519 public key]`
+///
+/// Unknown TLVs are skipped. Both known fields must occur exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedPeerState {
+    pub capabilities: PeerCapabilities,
+    pub signing_public_key: [u8; 32],
+}
+
+impl AuthenticatedPeerState {
+    const VERSION: u8 = 0x01;
+    const CAPABILITIES_TLV: u8 = 0x01;
+    const SIGNING_PUBLIC_KEY_TLV: u8 = 0x02;
+
+    pub fn new(capabilities: PeerCapabilities, signing_public_key: [u8; 32]) -> Self {
+        Self {
+            capabilities,
+            signing_public_key,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let capability_bytes = self.capabilities.encode();
+        let mut out = Vec::with_capacity(1 + 2 + capability_bytes.len() + 2 + 32);
+        out.push(Self::VERSION);
+        out.push(Self::CAPABILITIES_TLV);
+        out.push(capability_bytes.len() as u8);
+        out.extend_from_slice(&capability_bytes);
+        out.push(Self::SIGNING_PUBLIC_KEY_TLV);
+        out.push(32);
+        out.extend_from_slice(&self.signing_public_key);
+        out
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.first().copied() != Some(Self::VERSION) {
+            return None;
+        }
+        let mut offset = 1;
+        let mut capabilities: Option<PeerCapabilities> = None;
+        let mut signing_public_key: Option<[u8; 32]> = None;
+        while offset < data.len() {
+            if offset + 2 > data.len() {
+                return None;
+            }
+            let tlv_type = data[offset];
+            let length = data[offset + 1] as usize;
+            offset += 2;
+            if offset + length > data.len() {
+                return None;
+            }
+            let value = &data[offset..offset + length];
+            offset += length;
+            match tlv_type {
+                Self::CAPABILITIES_TLV => {
+                    if capabilities.is_some() || !(1..=8).contains(&length) {
+                        return None;
+                    }
+                    let decoded = PeerCapabilities::decode(value);
+                    if decoded.encode() != value {
+                        return None;
+                    }
+                    capabilities = Some(decoded);
+                }
+                Self::SIGNING_PUBLIC_KEY_TLV => {
+                    if signing_public_key.is_some() || length != 32 {
+                        return None;
+                    }
+                    signing_public_key = Some(value.try_into().ok()?);
+                }
+                _ => {}
+            }
+        }
+        Some(Self {
+            capabilities: capabilities?,
+            signing_public_key: signing_public_key?,
+        })
+    }
 }
 
 /// Prerelease iOS builds briefly emitted private files as 0x09. Decode-only

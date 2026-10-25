@@ -216,6 +216,24 @@ impl BitchatApp {
             LinkEvent::Delivered { peer_id, .. } => {
                 self.log(format!("delivre a {} ✓", self.nickname_of(&peer_id)));
             }
+            LinkEvent::PeerStateSent { peer_id } => {
+                self.log(format!(
+                    "etat authentifie envoye a {}",
+                    self.nickname_of(&peer_id)
+                ));
+            }
+            LinkEvent::PeerState {
+                peer_id,
+                capabilities,
+                signing_public_key,
+            } => {
+                self.log(format!(
+                    "etat authentifie de {} caps={:#x} cle={}",
+                    self.nickname_of(&peer_id),
+                    capabilities,
+                    &signing_public_key[..8.min(signing_public_key.len())]
+                ));
+            }
             LinkEvent::PeerDisconnected { peer_id } => {
                 self.set_session(&peer_id, false);
                 self.log(format!("{} deconnecte", self.nickname_of(&peer_id)));
@@ -713,6 +731,18 @@ fn main() -> eframe::Result<()> {
                                 }
                                 LinkEvent::Delivered { peer_id, .. } => {
                                     eprintln!("[chat] delivered -> {peer_id}")
+                                }
+                                LinkEvent::PeerStateSent { peer_id } => {
+                                    eprintln!("[peerstate] sent to {peer_id}")
+                                }
+                                LinkEvent::PeerState {
+                                    peer_id,
+                                    capabilities,
+                                    signing_public_key,
+                                } => {
+                                    eprintln!(
+                                        "[peerstate] from {peer_id} caps={capabilities:#x} key={signing_public_key}"
+                                    )
                                 }
                                 LinkEvent::PeerDisconnected { peer_id } => {
                                     eprintln!("[link] {peer_id} disconnected")
