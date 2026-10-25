@@ -302,7 +302,10 @@ impl BitchatApp {
                     .desired_width(170.0)
                     .font(egui::TextStyle::Heading),
             );
-            if ui.button("ok").clicked()
+            if ui
+                .button("ok")
+                .on_hover_text("appliquer le pseudo")
+                .clicked()
                 || (response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter)))
             {
@@ -579,6 +582,7 @@ impl eframe::App for BitchatApp {
                             .corner_radius(20)
                             .min_size(egui::vec2(46.0, 42.0)),
                     )
+                    .on_hover_text("envoyer (Entree)")
                     .clicked();
                 if (send || enter) && !self.draft.trim().is_empty() {
                     self.send_draft();
@@ -667,6 +671,28 @@ fn main() -> eframe::Result<()> {
                 tokio::select! {
                     event = link.events.recv() => match event {
                         Some(event) => {
+                            // Mirror link events into the log file for debugging.
+                            match &event {
+                                LinkEvent::Info(message) => eprintln!("[info] {message}"),
+                                LinkEvent::PeerAnnounced { peer_id, nickname, verified, .. } => {
+                                    eprintln!("[announce] {nickname} ({peer_id}) verified={verified}")
+                                }
+                                LinkEvent::SessionEstablished { peer_id } => {
+                                    eprintln!("[session] established with {peer_id}")
+                                }
+                                LinkEvent::PrivateMessage { peer_id, content, .. } => {
+                                    eprintln!("[chat] private from {peer_id}: {content}")
+                                }
+                                LinkEvent::BroadcastMessage { peer_id, content } => {
+                                    eprintln!("[chat] broadcast from {peer_id}: {content}")
+                                }
+                                LinkEvent::Delivered { peer_id, .. } => {
+                                    eprintln!("[chat] delivered -> {peer_id}")
+                                }
+                                LinkEvent::PeerDisconnected { peer_id } => {
+                                    eprintln!("[link] {peer_id} disconnected")
+                                }
+                            }
                             if event_tx.send(event).is_err() {
                                 break;
                             }
