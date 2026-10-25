@@ -8,3 +8,7 @@
 
 pub mod central;
 pub mod frame;
+#[cfg(windows)]
+pub mod peripheral;
+
+pub use btleplug::platform::PeripheralId;

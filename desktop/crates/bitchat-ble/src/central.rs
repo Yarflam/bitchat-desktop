@@ -116,7 +116,7 @@ fn peripheral_id_from_address(address: [u8; 6]) -> Option<PeripheralId> {
 /// Handle for driving a running [`CentralNode`].
 pub struct CentralHandle {
     pub events: mpsc::Receiver<CentralEventOut>,
-    commands: mpsc::Sender<CentralCommand>,
+    pub commands: mpsc::Sender<CentralCommand>,
 }
 
 impl CentralHandle {

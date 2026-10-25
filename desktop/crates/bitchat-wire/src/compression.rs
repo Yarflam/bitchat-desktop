@@ -77,7 +77,7 @@ fn looks_like_zlib(data: &[u8]) -> bool {
     }
     let cmf = data[0] as usize;
     let flg = data[1] as usize;
-    (cmf & 0x0F) == 8 && (cmf >> 4) <= 7 && ((cmf << 8) | flg) % 31 == 0
+    (cmf & 0x0F) == 8 && (cmf >> 4) <= 7 && ((cmf << 8) | flg).is_multiple_of(31)
 }
 
 fn inflate_exact(data: &[u8], original_size: usize, zlib: bool) -> Option<Vec<u8>> {
@@ -136,8 +136,8 @@ mod tests {
 
     #[test]
     fn should_compress_matches_entropy_heuristic() {
-        assert!(!should_compress(&vec![0u8; 99]));
-        assert!(should_compress(&vec![0u8; 100]));
+        assert!(!should_compress(&[0u8; 99]));
+        assert!(should_compress(&[0u8; 100]));
         // 100 bytes of maximal diversity are treated as pre-compressed.
         let diverse: Vec<u8> = (0..100u8).cycle().take(100).collect();
         assert!(!should_compress(&diverse));

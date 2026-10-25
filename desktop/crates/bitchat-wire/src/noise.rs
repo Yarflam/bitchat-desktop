@@ -26,7 +26,8 @@ const NONCE_SIZE_BYTES: usize = 4;
 const REPLAY_WINDOW_SIZE: u64 = 1024;
 const REPLAY_WINDOW_BYTES: usize = (REPLAY_WINDOW_SIZE / 8) as usize;
 
-const PROTOCOL: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+/// The Noise protocol name string as used on the wire.
+pub const PROTOCOL: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoiseError {
@@ -389,7 +390,7 @@ fn mark_nonce_as_seen(received: u64, highest: &mut u64, window: &mut [u8; REPLAY
                 let mut new_byte = 0u8;
                 if source_byte_index >= 0 {
                     new_byte = window[source_byte_index as usize] >> (shift % 8);
-                    if source_byte_index > 0 && shift % 8 != 0 {
+                    if source_byte_index > 0 && !shift.is_multiple_of(8) {
                         new_byte |= window[source_byte_index as usize - 1] << (8 - shift % 8);
                     }
                 }

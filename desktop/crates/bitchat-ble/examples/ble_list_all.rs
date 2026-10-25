@@ -18,22 +18,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen = std::collections::HashSet::new();
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(event)) =
+        if let Ok(Some(CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id))) =
             tokio::time::timeout(std::time::Duration::from_secs(1), events.next()).await
         {
-            if let CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) = event {
-                if seen.insert(id.clone()) {
-                    if let Ok(p) = adapter.peripheral(&id).await {
-                        if let Ok(Some(props)) = p.properties().await {
-                            println!(
-                                "  {} rssi={:?} name={:?} services={:?} svc_data_keys={:?}",
-                                props.address,
-                                props.rssi,
-                                props.local_name,
-                                props.services,
-                                props.service_data.keys().collect::<Vec<_>>()
-                            );
-                        }
+            if seen.insert(id.clone()) {
+                if let Ok(p) = adapter.peripheral(&id).await {
+                    if let Ok(Some(props)) = p.properties().await {
+                        println!(
+                            "  {} rssi={:?} name={:?} services={:?} svc_data_keys={:?}",
+                            props.address,
+                            props.rssi,
+                            props.local_name,
+                            props.services,
+                            props.service_data.keys().collect::<Vec<_>>()
+                        );
                     }
                 }
             }

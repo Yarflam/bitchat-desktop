@@ -119,7 +119,7 @@ fn tlv_decoders_reject_missing_fields_and_truncated_values() {
     assert!(RequestSyncPacket::decode(&hex("0100011302000401020304")).is_none());
     assert!(IdentityAnnouncement::decode(&hex("0103626f62022011")).is_none());
     assert!(FilePacket::decode(&hex("010001610400000002de")).is_none());
-    assert!(FragmentPayload::decode(&vec![0u8; 12]).is_none());
+    assert!(FragmentPayload::decode(&[0u8; 12]).is_none());
 }
 
 #[test]

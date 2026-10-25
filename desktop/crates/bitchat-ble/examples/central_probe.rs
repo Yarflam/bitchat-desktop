@@ -23,18 +23,18 @@ fn describe_packet(packet: &bitchat_wire::packet::Packet) -> String {
     match MessageType::from_value(packet.packet_type) {
         Some(MessageType::Announce) => match IdentityAnnouncement::decode(&packet.payload) {
             Some(announce) => {
+                // The wire peer ID is derived from the Noise static key,
+                // matching NoisePeerIdentity.derivePeerID on Android.
                 let peer_id = derive_peer_id(
                     &announce
-                        .signing_public_key
+                        .noise_public_key
                         .clone()
                         .try_into()
                         .unwrap_or([0u8; 32]),
                 );
                 format!(
-                    "ANNOUNCE nickname={:?} signing_peer_id={peer_id} caps={:?} noise_key={} bytes",
-                    announce.nickname,
-                    announce.capabilities,
-                    announce.noise_public_key.len()
+                    "ANNOUNCE nickname={:?} noise_peer_id={peer_id} caps={:?}",
+                    announce.nickname, announce.capabilities,
                 )
             }
             None => format!(
