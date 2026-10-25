@@ -31,13 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut link = MeshLink::start(identity, &nickname, 256).await?;
     println!("scanning for BitChat peers...");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    // Daemon mode: run until killed (the previous 120 s demo deadline made
+    // detached nodes exit on their own).
     let mut sent_to: Option<String> = None;
 
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline - tokio::time::Instant::now();
-        let timeout = remaining.min(Duration::from_secs(5));
-        match tokio::time::timeout(timeout, link.events.recv()).await {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), link.events.recv()).await {
             Ok(Some(event)) => match event {
                 LinkEvent::PeerAnnounced {
                     peer_id,
@@ -75,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 LinkEvent::Info(message) => println!("[info    ] {message}"),
             },
-            Ok(None) => break,
+            Ok(None) => break, // link closed
+            // Elapsed: fall through to the waiting-prompt below.
             Err(_) => {
                 if message.is_some() && sent_to.is_none() {
                     println!("... still waiting for a peer (keep bitchat in the foreground on the phone)");
