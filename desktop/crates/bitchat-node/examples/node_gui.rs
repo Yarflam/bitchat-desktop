@@ -67,6 +67,40 @@ fn terminal_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Radio-waves glyph painted with primitives (default fonts lack the unicode).
+fn radio_icon(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 16.0), egui::Sense::hover());
+    let center = egui::pos2(rect.center().x, rect.bottom() - 2.0);
+    ui.painter().circle_filled(center, 2.0, color);
+    for radius in [5.5f32, 9.0, 12.5] {
+        let points: Vec<egui::Pos2> = (0..=10)
+            .map(|k| {
+                let angle = std::f32::consts::PI * (0.2 + 0.6 * k as f32 / 10.0);
+                egui::pos2(center.x - radius * angle.cos(), center.y - radius * angle.sin())
+            })
+            .collect();
+        ui.painter()
+            .add(egui::Shape::line(points, egui::Stroke::new(1.6, color)));
+    }
+}
+
+/// Small status dot.
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(egui::pos2(rect.center().x, rect.center().y), 4.0, color);
+}
+
+/// Green block logo, like the app's pixel robot glyph.
+fn block_logo(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 20.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect.shrink2(egui::vec2(1.0, 4.0)),
+        egui::CornerRadius::same(2),
+        GREEN,
+    );
+}
+
 fn now_hm() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -110,11 +144,14 @@ struct BitchatApp {
     nick_draft: String,
     editing_nick: bool,
     status: String,
+    logs: std::collections::VecDeque<String>,
     peers: Vec<PeerInfo>,
-    logs: HashMap<String, Vec<ChatLine>>,
+    chat: HashMap<String, Vec<ChatLine>>,
     selected: Selection,
     draft: String,
 }
+
+const MAX_LOG_LINES: usize = 60;
 
 impl BitchatApp {
     fn nickname_path(identity_path: &Path) -> PathBuf {
@@ -160,10 +197,10 @@ impl BitchatApp {
             }
             LinkEvent::SessionEstablished { peer_id } => {
                 self.set_session(&peer_id, true);
-                self.status = format!(
+                self.log(format!(
                     "session chiffree etablie avec {}",
                     self.nickname_of(&peer_id)
-                );
+                ));
             }
             LinkEvent::PrivateMessage {
                 peer_id, content, ..
@@ -176,14 +213,14 @@ impl BitchatApp {
                 self.push_line(CHANNEL_KEY, &nickname, content);
             }
             LinkEvent::Delivered { peer_id, .. } => {
-                self.status = format!("delivre a {} ✓", self.nickname_of(&peer_id));
+                self.log(format!("delivre a {} ✓", self.nickname_of(&peer_id)));
             }
             LinkEvent::PeerDisconnected { peer_id } => {
                 self.set_session(&peer_id, false);
-                self.status = format!("{} deconnecte", self.nickname_of(&peer_id));
+                self.log(format!("{} deconnecte", self.nickname_of(&peer_id)));
             }
             LinkEvent::Info(message) => {
-                self.status = message;
+                self.log(message);
             }
         }
     }
@@ -218,11 +255,19 @@ impl BitchatApp {
     }
 
     fn push_line(&mut self, key: &str, who: &str, text: String) {
-        self.logs.entry(key.to_string()).or_default().push(ChatLine {
+        self.chat.entry(key.to_string()).or_default().push(ChatLine {
             who: who.to_string(),
             text,
             time: now_hm(),
         });
+    }
+
+    fn log(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.logs.push_back(self.status.clone());
+        if self.logs.len() > MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
     }
 
     fn send_draft(&mut self) {
@@ -269,21 +314,24 @@ impl BitchatApp {
                 }
                 self.editing_nick = false;
             }
-        } else if ui
-            .add(
-                egui::Button::new(
-                    egui::RichText::new(format!("⣿ / @{}", self.nickname))
-                        .heading()
-                        .color(GREEN),
+        } else {
+            block_logo(ui);
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("/ @{}", self.nickname))
+                            .heading()
+                            .color(GREEN),
+                    )
+                    .fill(BG)
+                    .corner_radius(6),
                 )
-                .fill(BG)
-                .corner_radius(6),
-            )
-            .on_hover_text("changer le pseudo")
-            .clicked()
-        {
-            self.editing_nick = true;
-            self.nick_draft = self.nickname.clone();
+                .on_hover_text("changer le pseudo")
+                .clicked()
+            {
+                self.editing_nick = true;
+                self.nick_draft = self.nickname.clone();
+            }
         }
     }
 
@@ -315,52 +363,76 @@ impl BitchatApp {
         }
         ui.add_space(6.0);
         ui.label(egui::RichText::new("PEERS").small().color(TEXT_TERTIARY));
-        ui.separator();
+        ui.add_space(2.0);
 
         let mut pick: Option<Selection> = None;
-        for peer in &self.peers {
-            let selected = self.selected == Selection::Peer(peer.peer_id.clone());
-            let cursor = if selected { ">" } else { " " };
-            let lock = if peer.has_session {
-                " [tls]"
-            } else if peer.verified {
-                " [sig]"
-            } else {
-                " [!]"
-            };
-            let row = egui::Frame::new()
-                .fill(if selected { ROW_SELECTED } else { BG })
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{cursor} @{}" , peer.nickname))
-                                .color(if selected { GREEN } else { TEXT }),
-                        );
-                        ui.label(
-                            egui::RichText::new(lock).small().color(TEXT_TERTIARY),
-                        );
-                    });
-                    ui.label(
-                        egui::RichText::new(format!("    {}", &peer.peer_id[..8]))
-                            .small()
-                            .color(TEXT_TERTIARY),
+        egui::ScrollArea::vertical()
+            .id_salt("peers")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for peer in &self.peers {
+                    let selected = self.selected == Selection::Peer(peer.peer_id.clone());
+                    let dot = if peer.has_session {
+                        GREEN
+                    } else if peer.verified {
+                        AMBER
+                    } else {
+                        TEXT_TERTIARY
+                    };
+                    let row = egui::Frame::new()
+                        .fill(if selected { ROW_SELECTED } else { BG })
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                status_dot(ui, dot);
+                                ui.label(
+                                    egui::RichText::new(format!("@{}", peer.nickname))
+                                        .color(if selected { GREEN } else { TEXT }),
+                                );
+                                if peer.has_session {
+                                    ui.label(
+                                        egui::RichText::new("[tls]")
+                                            .small()
+                                            .color(TEXT_TERTIARY),
+                                    );
+                                }
+                            });
+                        })
+                        .response;
+                    let click = ui.interact(
+                        row.rect,
+                        egui::Id::new(("peer_row", peer.peer_id.clone())),
+                        egui::Sense::click(),
                     );
-                })
-                .response;
-            let click = ui.interact(
-                row.rect,
-                egui::Id::new(("peer_row", peer.peer_id.clone())),
-                egui::Sense::click(),
-            );
-            if click.clicked() {
-                pick = Some(Selection::Peer(peer.peer_id.clone()));
-            }
-        }
+                    if click.clicked() {
+                        pick = Some(Selection::Peer(peer.peer_id.clone()));
+                    }
+                    row.on_hover_text(peer.peer_id.clone());
+                }
+            });
         if let Some(selection) = pick {
             self.selected = selection;
         }
+
+        ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("logs").small().color(TEXT_TERTIARY))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("logs")
+                    .max_height(140.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.label(
+                                egui::RichText::new(format!("# {line}"))
+                                    .small()
+                                    .color(TEXT_TERTIARY),
+                            );
+                        }
+                    });
+            });
     }
 
     fn show_messages(&self, ui: &mut egui::Ui, key: &str) {
@@ -368,7 +440,7 @@ impl BitchatApp {
             .stick_to_bottom(true)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let lines = self.logs.get(key).cloned().unwrap_or_default();
+                let lines = self.chat.get(key).cloned().unwrap_or_default();
                 for line in &lines {
                     let own = line.who == self.nickname;
                     let (fill, border, name_color, time_color) = if own {
@@ -437,6 +509,7 @@ impl BitchatApp {
 
 impl eframe::App for BitchatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_cursor_icon(egui::CursorIcon::Default);
         while let Ok(event) = self.events_in.try_recv() {
             self.apply(event);
         }
@@ -457,10 +530,9 @@ impl eframe::App for BitchatApp {
                             .heading()
                             .color(BLUE),
                     );
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("⟨(⟩ mesh").heading().color(BLUE),
-                    );
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("mesh").heading().color(BLUE));
+                    radio_icon(ui, BLUE);
                     ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new(format!("#{}", &self.our_id[..8]))
@@ -512,15 +584,7 @@ impl eframe::App for BitchatApp {
                     self.send_draft();
                 }
             });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("# {}", self.status))
-                        .small()
-                        .color(TEXT_TERTIARY),
-                );
-            });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -539,9 +603,9 @@ impl eframe::App for BitchatApp {
                         peer_id.clone(),
                         format!("@{}", self.nickname_of(peer_id)),
                         if session {
-                            "session chiffree [tls]".to_string()
+                            format!("{} · session chiffree [tls]", &peer_id[..8])
                         } else {
-                            "en attente de session…".to_string()
+                            format!("{} · en attente de session…", &peer_id[..8])
                         },
                     )
                 }
@@ -559,6 +623,11 @@ impl eframe::App for BitchatApp {
             ui.add_space(2.0);
             self.show_messages(ui, &key);
         });
+
+        // Hand cursor over any clickable widget.
+        if ctx.is_pointer_over_area() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
     }
 }
 
@@ -637,7 +706,8 @@ fn main() -> eframe::Result<()> {
         editing_nick: false,
         status: "scan BLE en cours…".to_string(),
         peers: Vec::new(),
-        logs: HashMap::new(),
+        logs: std::collections::VecDeque::new(),
+        chat: HashMap::new(),
         selected: Selection::Broadcast,
         draft: String::new(),
     };

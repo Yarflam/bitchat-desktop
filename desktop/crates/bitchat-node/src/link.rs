@@ -149,7 +149,7 @@ impl MeshLink {
 
         // The desktop node participates in both roles, like the Android
         // client: BLE central (btleplug) plus GATT server (WinRT).
-        let (peripheral, peripheral_events) = spawn_peripheral();
+        let (peripheral, peripheral_events) = spawn_peripheral(identity.peer_id_bytes());
 
         let mut actor = Actor {
             identity,
@@ -1239,14 +1239,18 @@ impl Actor {
 
 /// Start the GATT server on Windows; a never-fed event stream elsewhere.
 #[cfg(windows)]
-fn spawn_peripheral() -> (Option<PeripheralHandle>, mpsc::Receiver<PeripheralEvent>) {
-    let (handle, events) = bitchat_ble::peripheral::start();
+fn spawn_peripheral(
+    peer_id: [u8; 8],
+) -> (Option<PeripheralHandle>, mpsc::Receiver<PeripheralEvent>) {
+    let (handle, events) = bitchat_ble::peripheral::start(peer_id);
     (Some(handle), events)
 }
 
 /// Start the GATT server on Windows; a never-fed event stream elsewhere.
 #[cfg(not(windows))]
-fn spawn_peripheral() -> (Option<PeripheralHandle>, mpsc::Receiver<PeripheralEvent>) {
+fn spawn_peripheral(
+    _peer_id: [u8; 8],
+) -> (Option<PeripheralHandle>, mpsc::Receiver<PeripheralEvent>) {
     (None, mpsc::channel(1).1)
 }
 

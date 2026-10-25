@@ -14,6 +14,10 @@ mod imp {
     use tokio::sync::mpsc;
 
     use windows::core::GUID;
+    use windows::Devices::Bluetooth::Advertisement::{
+        BluetoothLEAdvertisement, BluetoothLEAdvertisementDataSection,
+        BluetoothLEAdvertisementPublisher,
+    };
     use windows::Devices::Bluetooth::GenericAttributeProfile::*;
     use windows::Foundation::TypedEventHandler;
     use windows::Storage::Streams::{DataReader, DataWriter, IBuffer};
@@ -26,6 +30,28 @@ mod imp {
     pub const SERVICE_UUID: GUID = GUID::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);
     /// Mesh data characteristic UUID (write + notify).
     pub const CHARACTERISTIC_UUID: GUID = GUID::from_u128(0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D);
+
+    /// Service UUID as it appears in BLE advertisements (little-endian).
+    fn service_uuid_le_bytes() -> [u8; 16] {
+        SERVICE_UUID.to_u128().to_le_bytes()
+    }
+
+    /// BLE AD type values (Bluetooth LE spec, Core 4.0 Vol 3 Part C §11).
+    const AD_COMPLETE_LIST_128_BIT_SERVICE_UUIDS: u8 = 0x07;
+    const AD_SERVICE_DATA_128_BIT_UUID: u8 = 0x21;
+
+    fn data_section(
+        data_type: u8,
+        payload: &[u8],
+    ) -> Result<BluetoothLEAdvertisementDataSection, String> {
+        let section = BluetoothLEAdvertisementDataSection::new().map_err(|e| e.to_string())?;
+        section
+            .SetDataType(data_type)
+            .map_err(|e| e.to_string())?;
+        let buffer = make_buffer(payload).map_err(|e| e.to_string())?;
+        section.SetData(&buffer).map_err(|e| e.to_string())?;
+        Ok(section)
+    }
 
     /// Events emitted by the peripheral node.
     #[derive(Debug)]
@@ -95,12 +121,12 @@ mod imp {
 
     /// Start the GATT server and begin advertising. Returns the command
     /// handle plus the event stream.
-    pub fn start() -> (PeripheralHandle, mpsc::Receiver<PeripheralEvent>) {
+    pub fn start(peer_id: [u8; 8]) -> (PeripheralHandle, mpsc::Receiver<PeripheralEvent>) {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<PeripheralEvent>();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<PeripheralCommand>();
 
         thread::spawn(move || {
-            if let Err(message) = run(event_tx.clone(), cmd_rx) {
+            if let Err(message) = run(event_tx.clone(), cmd_rx, peer_id) {
                 let _ = event_tx.send(PeripheralEvent::AdvertisingFailed(message));
             }
         });
@@ -130,6 +156,7 @@ mod imp {
     fn run(
         event_tx: std::sync::mpsc::Sender<PeripheralEvent>,
         cmd_rx: std::sync::mpsc::Receiver<PeripheralCommand>,
+        peer_id: [u8; 8],
     ) -> Result<(), String> {
         let create = GattServiceProvider::CreateAsync(SERVICE_UUID)
             .and_then(|op| op.get())
@@ -218,19 +245,32 @@ mod imp {
                 .map_err(|e| format!("register subscribe handler: {e}"))?;
         }
 
-        // Keep provider alive: held by this thread until the command loop ends.
-        let adv_params =
-            GattServiceProviderAdvertisingParameters::new().map_err(|e| e.to_string())?;
-        adv_params
-            .SetIsDiscoverable(true)
+        // Keep provider alive: it hosts the GATT service for incoming
+        // connections for as long as this thread runs. Advertising itself is
+        // done with a BluetoothLEAdvertisementPublisher so we can attach the
+        // 8-byte peer ID as service data — the frame scanners need to
+        // recognize us as a BitChat peer (GattServiceProvider's built-in
+        // advertisement carries only the bare service UUID).
+        let advertisement =
+            BluetoothLEAdvertisement::new().map_err(|e| format!("create advertisement: {e}"))?;
+        let uuid_bytes = service_uuid_le_bytes();
+        let sections = advertisement.DataSections().map_err(|e| e.to_string())?;
+        let uuid_section = data_section(AD_COMPLETE_LIST_128_BIT_SERVICE_UUIDS, &uuid_bytes)?;
+        sections.Append(&uuid_section).map_err(|e| e.to_string())?;
+        let mut service_data = uuid_bytes.to_vec();
+        service_data.extend_from_slice(&peer_id);
+        let service_data_section = data_section(AD_SERVICE_DATA_128_BIT_UUID, &service_data)?;
+        sections
+            .Append(&service_data_section)
             .map_err(|e| e.to_string())?;
-        adv_params
-            .SetIsConnectable(true)
-            .map_err(|e| e.to_string())?;
-        provider
-            .StartAdvertisingWithParameters(&adv_params)
+
+        let publisher = BluetoothLEAdvertisementPublisher::Create(&advertisement)
+            .map_err(|e| format!("create publisher: {e}"))?;
+        publisher
+            .Start()
             .map_err(|e| format!("start advertising: {e}"))?;
         let _ = event_tx.send(PeripheralEvent::AdvertisingStarted);
+        let _publisher_alive = publisher;
 
         // Command loop: this thread owns the WinRT objects for their lifetime.
         while let Ok(command) = cmd_rx.recv() {
