@@ -68,10 +68,8 @@ pub fn build_filter(ids: &[[u8; 16]], max_bytes: usize, target_fpr: f64) -> GcsP
     let mut trimmed_n = ids.len().min(n_cap);
 
     let mut final_m = ((trimmed_n as u64) << p).max(1);
-    let mut mapped: Vec<u64> = Vec::new();
-    let mut encoded = Vec::new();
     loop {
-        mapped = ids[..trimmed_n.min(ids.len())]
+        let mut mapped: Vec<u64> = ids[..trimmed_n.min(ids.len())]
             .iter()
             .map(|id| {
                 let v = h64(id) % final_m;
@@ -80,18 +78,16 @@ pub fn build_filter(ids: &[[u8; 16]], max_bytes: usize, target_fpr: f64) -> GcsP
             .collect();
         mapped.sort_unstable();
         mapped.dedup();
-        encoded = encode(&mapped, p);
+        let encoded = encode(&mapped, p);
         if encoded.len() <= max_bytes || trimmed_n == 0 {
-            break;
+            return GcsParams {
+                p,
+                m: final_m,
+                data: encoded,
+            };
         }
         trimmed_n = trimmed_n * 9 / 10;
         final_m = ((trimmed_n as u64) << p).max(1);
-    }
-
-    GcsParams {
-        p,
-        m: final_m,
-        data: encoded,
     }
 }
 
