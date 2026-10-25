@@ -558,6 +558,9 @@ impl Actor {
                     NoisePayloadType::PrivateMessage => {
                         match PrivateMessagePacket::decode(&payload.data) {
                             Some(message) => {
+                                // Phone-parity behaviour: acknowledge receipt so
+                                // the sender's UI can mark the message delivered.
+                                self.deliver_delivered(sender, &message.message_id);
                                 let _ = self.events.try_send(LinkEvent::PrivateMessage {
                                     peer_id: sender.to_string(),
                                     message_id: message.message_id,
@@ -639,6 +642,42 @@ impl Actor {
             Ok(data) => data,
             Err(e) => {
                 self.info(format!("encrypt for {peer_id} failed: {e}"));
+                return;
+            }
+        };
+        let mut packet = Packet::new(
+            MessageType::NoiseEncrypted as u8,
+            MAX_TTL,
+            self.identity.peer_id_bytes(),
+            ciphertext,
+        );
+        packet.recipient_id = peer_bytes(peer_id);
+        packet.timestamp = now_ms();
+        self.sign_and_send(&route, packet);
+    }
+
+    /// Encrypt and send a Delivered ack for a received private message,
+    /// mirroring the phone client's automatic acknowledgement.
+    fn deliver_delivered(&mut self, peer_id: &str, message_id: &str) {
+        let Some(route) = self.routes.get(peer_id).cloned() else {
+            return;
+        };
+        if route.is_empty() {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(peer_id) else {
+            return;
+        };
+        if !session.is_established() {
+            return;
+        }
+        let envelope =
+            NoisePayload::new(NoisePayloadType::Delivered, message_id.as_bytes().to_vec())
+                .encode();
+        let ciphertext = match session.encrypt(&envelope) {
+            Ok(data) => data,
+            Err(e) => {
+                self.info(format!("delivered ack encrypt for {peer_id} failed: {e}"));
                 return;
             }
         };
