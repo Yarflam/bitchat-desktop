@@ -110,6 +110,12 @@ pub enum LinkEvent {
         capabilities: u64,
         signing_public_key: String,
     },
+    /// A peer advertisement was seen during scanning.
+    PeerDiscovered {
+        address: String,
+        peer_id: Option<String>,
+        rssi: Option<i16>,
+    },
     PeerDisconnected {
         peer_id: String,
     },
@@ -131,6 +137,9 @@ pub enum LinkCommand {
     SetNickname { nickname: String },
     /// Send a gossip sync request; `None` broadcasts to all neighbors.
     SendSyncRequest { target: Option<String> },
+    /// Force an outgoing connection to a known MAC address, bypassing the
+    /// scan-based gate (same job as the debug "Connect" action on mobile).
+    ConnectAddress { address: [u8; 6] },
     Shutdown,
 }
 
@@ -234,6 +243,14 @@ impl MeshLink {
             .map_err(|_| LinkError::Closed)
     }
 
+    /// Force-connect to a peer by MAC address (manual bootstrap).
+    pub async fn connect_by_address(&self, address: [u8; 6]) -> Result<(), LinkError> {
+        self.commands
+            .send(LinkCommand::ConnectAddress { address })
+            .await
+            .map_err(|_| LinkError::Closed)
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.commands.send(LinkCommand::Shutdown).await;
     }
@@ -304,6 +321,16 @@ impl Actor {
                     }
                     Some(LinkCommand::SendBroadcastMessage { content }) => {
                         self.send_broadcast_message(&content).await;
+                    }
+                    Some(LinkCommand::ConnectAddress { address }) => {
+                        self.info(format!(
+                            "manual connect to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                            address[0], address[1], address[2], address[3], address[4], address[5]
+                        ));
+                        let _ = self
+                            .central_commands
+                            .send(CentralCommand::ConnectByAddress(address))
+                            .await;
                     }
                     Some(LinkCommand::SetNickname { nickname }) => {
                         let nickname = nickname.trim();
@@ -398,6 +425,11 @@ impl Actor {
     async fn handle_central(&mut self, event: CentralEventOut) {
         match event {
             CentralEventOut::Discovered(info) => {
+                let _ = self.events.try_send(LinkEvent::PeerDiscovered {
+                    address: info.address.clone(),
+                    peer_id: info.advertised_peer_id.map(|id| to_hex(&id)),
+                    rssi: info.rssi,
+                });
                 if let Some(advertised) = &info.advertised_peer_id {
                     let wire_id = hex(advertised);
                     if !self.routes.contains_key(&wire_id) && !self.connecting.contains(&info.id) {

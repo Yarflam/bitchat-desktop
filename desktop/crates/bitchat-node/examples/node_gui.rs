@@ -114,6 +114,8 @@ enum UiCommand {
     SendPrivate { peer_id: String, content: String },
     SendBroadcast { content: String },
     SetNickname { nickname: String },
+    /// Force an outgoing connection to a scanned MAC address.
+    Connect { address: String },
 }
 
 #[derive(Clone)]
@@ -129,6 +131,14 @@ struct ChatLine {
     who: String,
     text: String,
     time: String,
+}
+
+#[derive(Clone)]
+struct ScanEntry {
+    address: String,
+    peer_id: Option<String>,
+    rssi: Option<i16>,
+    last_seen: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -164,6 +174,8 @@ struct BitchatApp {
     focus_composer: bool,
     /// Incoming messages waiting for a focus check before desktop notification.
     pending_notifs: Vec<(String, String)>,
+    /// Recently scanned devices (like the mobile debug scan list).
+    scan: Vec<ScanEntry>,
 }
 
 const MAX_LOG_LINES: usize = 60;
@@ -305,6 +317,28 @@ impl BitchatApp {
             LinkEvent::PeerDisconnected { peer_id } => {
                 self.set_session(&peer_id, false);
                 self.log(format!("{} deconnecte", self.nickname_of(&peer_id)));
+            }
+            LinkEvent::PeerDiscovered {
+                address,
+                peer_id,
+                rssi,
+            } => {
+                if let Some(entry) = self.scan.iter_mut().find(|e| e.address == address) {
+                    entry.peer_id = peer_id.or_else(|| entry.peer_id.clone());
+                    entry.rssi = rssi.or(entry.rssi);
+                    entry.last_seen = now_hm();
+                } else {
+                    self.scan.insert(
+                        0,
+                        ScanEntry {
+                            address,
+                            peer_id,
+                            rssi,
+                            last_seen: now_hm(),
+                        },
+                    );
+                    self.scan.truncate(20);
+                }
             }
             LinkEvent::Info(message) => {
                 self.log(message);
@@ -890,14 +924,92 @@ impl BitchatApp {
                     }
 
                     section_label(ui, "Recent scan results");
-                    settings_row(
-                        ui,
-                        TEXT_TERTIARY,
-                        "Scanner",
-                        "Results are consumed immediately by auto-connect; nothing is buffered.",
-                        "auto",
-                        false,
-                    );
+                    if self.scan.is_empty() {
+                        ui.label(
+                            egui::RichText::new("None").small().color(TEXT_TERTIARY),
+                        );
+                    }
+                    for entry in self.scan.clone() {
+                        let known = self.peers.iter().any(|peer| {
+                            entry
+                                .peer_id
+                                .as_deref()
+                                .is_some_and(|id| peer.peer_id == id)
+                        });
+                        let title = format!(
+                            "{} • {}",
+                            entry.peer_id.as_deref().unwrap_or("unknown"),
+                            entry.address
+                        );
+                        let subtitle = format!(
+                            "RSSI: {} · seen {}",
+                            entry
+                                .rssi
+                                .map_or("?".to_string(), |value| value.to_string()),
+                            entry.last_seen
+                        );
+                        egui::Frame::new()
+                            .fill(SURFACE)
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(
+                                        ui,
+                                        if known { GREEN } else { TEXT_TERTIARY },
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(title)
+                                                .color(TEXT)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(subtitle)
+                                                .small()
+                                                .color(TEXT_TERTIARY),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("Connect")
+                                                            .small()
+                                                            .color(BG),
+                                                    )
+                                                    .fill(if known {
+                                                        TEXT_TERTIARY
+                                                    } else {
+                                                        GREEN
+                                                    })
+                                                    .corner_radius(6),
+                                                )
+                                                .on_hover_text(if known {
+                                                    "already connected"
+                                                } else {
+                                                    "force an outgoing connection (like the mobile debug Connect)"
+                                                })
+                                                .clicked()
+                                                && !known
+                                            {
+                                                let _ = self.cmd_out.send(UiCommand::Connect {
+                                                    address: entry.address.clone(),
+                                                });
+                                                self.log(format!(
+                                                    "connexion forcee vers {}",
+                                                    entry.address
+                                                ));
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
 
                     section_label(ui, "Debug console");
                     egui::Frame::new()
@@ -937,11 +1049,6 @@ impl eframe::App for BitchatApp {
         }
         ctx.request_repaint_after(Duration::from_millis(300));
 
-        // Keep the composer focused after sending or switching conversation.
-        if self.focus_composer {
-            self.focus_composer = false;
-            ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("composer")));
-        }
 
         // Desktop notifications for incoming messages while unfocused.
         if !self.pending_notifs.is_empty() {
@@ -1029,6 +1136,12 @@ impl eframe::App for BitchatApp {
                     .inner_margin(egui::Margin::symmetric(6, 2))
                     .show(ui, |ui| ui.add(input))
                     .inner;
+                if self.focus_composer {
+                    // Re-grab focus in the same frame the widget exists, so
+                    // typing continues right after sending or switching.
+                    self.focus_composer = false;
+                    response.request_focus();
+                }
                 let enter = response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 let send = ui
@@ -1096,6 +1209,18 @@ impl eframe::App for BitchatApp {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
+}
+
+fn parse_mac(address: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        mac[index] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -1197,6 +1322,9 @@ fn main() -> eframe::Result<()> {
                                 LinkEvent::PeerDisconnected { peer_id } => {
                                     eprintln!("[link] {peer_id} disconnected")
                                 }
+                                LinkEvent::PeerDiscovered { address, peer_id, rssi } => {
+                                    eprintln!("[scan] {address} peer={peer_id:?} rssi={rssi:?}")
+                                }
                             }
                             if event_tx.send(event).is_err() {
                                 break;
@@ -1219,6 +1347,17 @@ fn main() -> eframe::Result<()> {
                         Some(UiCommand::SetNickname { nickname }) => {
                             if let Err(error) = link.set_nickname(&nickname).await {
                                 eprintln!("bitchatd: set nickname failed: {error}");
+                            }
+                        }
+                        Some(UiCommand::Connect { address }) => {
+                            let parsed = parse_mac(&address);
+                            match parsed {
+                                Some(mac) => {
+                                    if let Err(error) = link.connect_by_address(mac).await {
+                                        eprintln!("bitchatd: connect to {address} failed: {error}");
+                                    }
+                                }
+                                None => eprintln!("bitchatd: invalid MAC address '{address}'"),
                             }
                         }
                         None => break,
@@ -1247,6 +1386,7 @@ fn main() -> eframe::Result<()> {
         show_debug: false,
         focus_composer: false,
         pending_notifs: Vec::new(),
+        scan: Vec::new(),
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

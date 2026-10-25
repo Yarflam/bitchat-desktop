@@ -92,6 +92,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 LinkEvent::PeerDisconnected { peer_id } => {
                     println!("[link    ] {peer_id} disconnected")
                 }
+                LinkEvent::PeerDiscovered {
+                    address,
+                    peer_id,
+                    rssi,
+                } => println!("[scan    ] {address} peer={peer_id:?} rssi={rssi:?}"),
                 LinkEvent::Info(message) => println!("[info    ] {message}"),
             },
             Ok(None) => break, // link closed
