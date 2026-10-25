@@ -350,6 +350,15 @@ impl Actor {
     }
 
     async fn handle_packet_route(&mut self, sender: &str, packet: Packet, via: Route) {
+        if std::env::var_os("BITCHATD_DEBUG_HEX").is_some() {
+            let frame = bitchat_wire::packet::encode(&packet);
+            eprintln!(
+                "[debug-hex] rx type={:#04x} from={sender} len={} {}",
+                packet.packet_type,
+                frame.as_ref().map_or(0, |f| f.len()),
+                frame.as_deref().map(to_hex).unwrap_or_default()
+            );
+        }
         if sender == self.identity.peer_id {
             return; // our own echo
         }
@@ -503,7 +512,14 @@ impl Actor {
     }
 
     async fn handle_noise_encrypted(&mut self, sender: &str, packet: Packet) {
+        let debug = std::env::var_os("BITCHATD_DEBUG_HEX").is_some();
         if packet.recipient_id != Some(self.identity.peer_id_bytes()) {
+            if debug {
+                eprintln!(
+                    "[debug-hex] 0x11 dropped: recipient mismatch {:?} != ours",
+                    packet.recipient_id.map(|r| to_hex(&r))
+                );
+            }
             return;
         }
 
@@ -514,7 +530,14 @@ impl Actor {
                 ));
                 return;
             };
-            session.decrypt(&packet.payload)
+            let out = session.decrypt(&packet.payload);
+            if debug {
+                eprintln!(
+                    "[debug-hex] 0x11 decrypt from {sender}: {}",
+                    if out.is_ok() { "ok" } else { "FAILED" }
+                );
+            }
+            out
         };
 
         match plaintext {
@@ -524,6 +547,13 @@ impl Actor {
                     self.info(format!("undecodable NoisePayload from {sender}"));
                     return;
                 };
+                if debug {
+                    eprintln!(
+                        "[debug-hex] 0x11 payload type={:?} len={}",
+                        payload.payload_type,
+                        payload.data.len()
+                    );
+                }
                 match payload.payload_type {
                     NoisePayloadType::PrivateMessage => {
                         match PrivateMessagePacket::decode(&payload.data) {

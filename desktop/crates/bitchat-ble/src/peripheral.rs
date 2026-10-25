@@ -317,7 +317,15 @@ mod imp {
                         peer_id,
                         packet,
                     });
+                } else if std::env::var_os("BITCHATD_DEBUG_HEX").is_some() {
+                    eprintln!("[gatt-server] dropped packet type={:#04x}: no session", packet.packet_type);
                 }
+            } else if std::env::var_os("BITCHATD_DEBUG_HEX").is_some() {
+                eprintln!(
+                    "[gatt-server] undecodable write ({} bytes): {}",
+                    data.len(),
+                    data.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                );
             }
         }
         if request.Option()? == GattWriteOption::WriteWithResponse {
