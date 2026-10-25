@@ -147,8 +147,31 @@ impl Packet {
         let mut unsigned = self.clone();
         unsigned.signature = None;
         unsigned.ttl = SIGNING_TTL;
-        encode(&unsigned)
+        let mut frame = encode(&unsigned)?;
+        pad_for_signing(&mut frame);
+        Some(frame)
     }
+}
+
+/// Deterministic PKCS#7-style signing padding, mirroring
+/// `MessagePadding.pad(BinaryProtocol.encode(unsignedPacket))` invoked by
+/// `toBinaryDataForSigning()` (encode defaults to `padding = true` even when
+/// the wire frame is unpadded): pad to the smallest block of
+/// {256, 512, 1024, 2048} that fits `len + 16`, skip when the pad would
+/// exceed 255 bytes (single-byte length marker). Relayers re-encode the
+/// decoded packet, so this must be a pure function of the unsigned frame.
+fn pad_for_signing(frame: &mut Vec<u8>) {
+    const BLOCK_SIZES: [usize; 4] = [256, 512, 1024, 2048];
+    let target = BLOCK_SIZES
+        .iter()
+        .copied()
+        .find(|b| frame.len() + 16 <= *b)
+        .unwrap_or(frame.len());
+    let needed = target.saturating_sub(frame.len());
+    if needed == 0 || needed > 255 {
+        return;
+    }
+    frame.resize(target, needed as u8);
 }
 
 fn header_size(version: u8) -> usize {

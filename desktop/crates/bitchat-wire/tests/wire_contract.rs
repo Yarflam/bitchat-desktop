@@ -90,6 +90,40 @@ fn v2_routed_signed_packet_matches_canonical_section_order() {
 }
 
 #[test]
+fn signing_preimage_is_deterministically_padded_like_kotlin() {
+    // Independent reconstruction of `toBinaryDataForSigning()`: the unsigned
+    // frame (signature omitted, TTL zeroed, HAS_SIGNATURE flag cleared) padded
+    // PKCS#7-style to the smallest block of {256,512,1024,2048} >= len + 16.
+    // Hand-built here so a self-consistent but wrong codec cannot pass.
+    let mut p = packet(
+        1,
+        MessageType::Announce as u8,
+        7,
+        0x0102030405060708,
+        "1020304050607080",
+        "aabbcc",
+    );
+    p.signature = Some([0x99u8; 64]);
+
+    let signing = p.encode_for_signing().unwrap();
+
+    let mut expected: Vec<u8> = Vec::new();
+    expected.push(1); // version
+    expected.push(MessageType::Announce as u8);
+    expected.push(0); // TTL normalized for signing
+    expected.extend_from_slice(&0x0102030405060708u64.to_be_bytes());
+    expected.push(0x00); // flags: no recipient, no signature, no compression
+    expected.extend_from_slice(&3u16.to_be_bytes()); // payload length
+    expected.extend_from_slice(&hex("1020304050607080")); // sender
+    expected.extend_from_slice(&[0xaau8, 0xbb, 0xcc]); // payload
+    let unsigned_len = expected.len(); // 14 + 8 + 3 = 25
+    let fill = 256usize - unsigned_len; // smallest block >= 25 + 16
+    expected.resize(256, fill as u8);
+
+    assert_eq!(expected, signing);
+}
+
+#[test]
 fn signing_preimage_uses_ttl_zero_and_omits_signature() {
     let mut p = packet(
         2,
