@@ -38,6 +38,16 @@ const MAX_TTL: u8 = 7;
 /// Android client does before re-handshaking.
 const MAX_DECRYPT_FAILURES: u32 = 3;
 
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -677,6 +687,16 @@ impl Actor {
 
     fn sign_and_send(&self, route: &Route, mut packet: Packet) {
         packet.signature = self.identity.signing.sign_packet(&packet);
+        if std::env::var_os("BITCHATD_DEBUG_HEX").is_some() {
+            if let Some(frame) = bitchat_wire::packet::encode(&packet) {
+                eprintln!(
+                    "[debug-hex] tx type={:#04x} len={} {}",
+                    packet.packet_type,
+                    frame.len(),
+                    to_hex(&frame)
+                );
+            }
+        }
         if let Some(peripheral) = &route.central {
             let _ = self.central_commands.try_send(CentralCommand::Send {
                 id: peripheral.clone(),
