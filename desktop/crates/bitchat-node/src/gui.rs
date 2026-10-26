@@ -180,13 +180,28 @@ fn mime_of(path: &std::path::Path) -> String {
     }
 }
 
-/// Small status dot, vertically aligned with the title text line it heads
-/// (monospace glyphs sit high in their line box, so the dot hugs the top
-/// of its 16 px allocation instead of centering on the whole text block).
-fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+/// Vertical distance from the allocation top to the dot center, tuned for
+/// the bundled monospace font: its line box is much taller than the glyphs
+/// (~11 px of top bearing at 14.5 pt), so centering the 16 px allocation
+/// puts the dot far above the visible text.
+fn dot_center_offset(font_size: f32) -> f32 {
+    1.24 * font_size
+}
+
+/// Small status dot, centered on the visible glyphs of the neighbouring
+/// text line rather than on the widget allocation.
+fn status_dot_sized(ui: &mut egui::Ui, color: egui::Color32, font_size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(egui::pos2(rect.center().x, rect.top() + 6.0), 4.0, color);
+    ui.painter().circle_filled(
+        egui::pos2(rect.center().x, rect.top() + dot_center_offset(font_size)),
+        4.0,
+        color,
+    );
+}
+
+/// Status dot next to a body-sized label (the common case).
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    status_dot_sized(ui, color, body_font(ui).size);
 }
 
 /// Green block logo, like the app's pixel robot glyph.
@@ -332,14 +347,14 @@ struct ContentSize {
     last_right: f32,
 }
 
-/// Human-readable byte size, French locale (`12 Ko`, `1,4 Mo`).
+/// Human-readable byte size (`12 KB`, `1.4 MB`).
 fn human_size(bytes: i64) -> String {
     if bytes < 1024 {
-        format!("{bytes} o")
+        format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
-        format!("{} Ko", bytes / 1024)
+        format!("{} KB", bytes / 1024)
     } else {
-        format!("{:.1} Mo", bytes as f32 / (1024.0 * 1024.0))
+        format!("{:.1} MB", bytes as f32 / (1024.0 * 1024.0))
     }
 }
 
@@ -447,6 +462,10 @@ fn settings_row_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
             // and that painted shape survives into the final paint, which is
             // what staggered the boxes. During sizing, run the same geometry
             // with a transparent fill; only the real pass paints.
+            // The monospace font carries ~11 px of invisible top bearing,
+            // so a symmetric margin looks top-heavy: shave the top and give
+            // it to the bottom to equalize the whitespace around the
+            // visible glyphs (box height unchanged).
             let frame = egui::Frame::new()
                 .fill(if ui.is_sizing_pass() {
                     egui::Color32::TRANSPARENT
@@ -454,7 +473,12 @@ fn settings_row_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
                     SURFACE
                 })
                 .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(12, 9));
+                .inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 5,
+                    bottom: 13,
+                });
             frame.show(ui, |ui| {
                 // Top alignment: the title line and its dot share the same
                 // top edge (center alignment pushed the text down so the
@@ -627,7 +651,7 @@ impl BitchatApp {
             LinkEvent::SessionEstablished { peer_id } => {
                 self.set_session(&peer_id, true);
                 self.log(format!(
-                    "session chiffree etablie avec {}",
+                    "encrypted session established with {}",
                     self.nickname_of(&peer_id)
                 ));
             }
@@ -652,10 +676,8 @@ impl BitchatApp {
             LinkEvent::PrivateFile { peer_id, file } => {
                 let nickname = self.nickname_of(&peer_id);
                 if self.notifications_enabled {
-                    self.pending_notifs.push((
-                        format!("@{} (fichier)", nickname),
-                        format!("📎 {} ({} o)", file.file_name, file.file_size),
-                    ));
+                    self.pending_notifs
+                        .push((format!("@{} (file)", nickname), format!("📎 {} ({} B)", file.file_name, file.file_size)));
                 }
                 self.push_file_line(ctx, &peer_id, &nickname, &peer_id, file);
             }
@@ -663,14 +685,14 @@ impl BitchatApp {
                 let nickname = self.nickname_of(&peer_id);
                 if self.notifications_enabled {
                     self.pending_notifs.push((
-                        format!("@{} (fichier, canal)", nickname),
-                        format!("📎 {} ({} o)", file.file_name, file.file_size),
+                        format!("@{} (file, channel)", nickname),
+                        format!("📎 {} ({} B)", file.file_name, file.file_size),
                     ));
                 }
                 self.push_file_line(ctx, CHANNEL_KEY, &nickname, &peer_id, file);
             }
             LinkEvent::Delivered { peer_id, .. } => {
-                self.log(format!("delivre a {} ✓", self.nickname_of(&peer_id)));
+                self.log(format!("delivered to {} ✓", self.nickname_of(&peer_id)));
                 // Ack the most recent own line of that conversation: the
                 // tick right of its timestamp turns green (Android parity).
                 if let Some(lines) = self.chat.get_mut(&peer_id) {
@@ -681,7 +703,7 @@ impl BitchatApp {
             }
             LinkEvent::PeerStateSent { peer_id } => {
                 self.log(format!(
-                    "etat authentifie envoye a {}",
+                    "authenticated state sent to {}",
                     self.nickname_of(&peer_id)
                 ));
             }
@@ -691,7 +713,7 @@ impl BitchatApp {
                 signing_public_key,
             } => {
                 self.log(format!(
-                    "etat authentifie de {} caps={:#x} cle={}",
+                    "authenticated state from {} caps={:#x} key={}",
                     self.nickname_of(&peer_id),
                     capabilities,
                     &signing_public_key[..8.min(signing_public_key.len())]
@@ -699,7 +721,7 @@ impl BitchatApp {
             }
             LinkEvent::PeerDisconnected { peer_id } => {
                 self.set_session(&peer_id, false);
-                self.log(format!("{} deconnecte", self.nickname_of(&peer_id)));
+                self.log(format!("{} disconnected", self.nickname_of(&peer_id)));
             }
             LinkEvent::PeerDiscovered {
                 address,
@@ -737,7 +759,7 @@ impl BitchatApp {
         {
             *peer = info;
         } else {
-            self.status = format!("peer annonce: {} ({})", info.nickname, info.peer_id);
+            self.status = format!("peer announced: {} ({})", info.nickname, info.peer_id);
             self.peers.push(info);
         }
     }
@@ -815,7 +837,7 @@ impl BitchatApp {
     ) {
         let saved = self.save_download(&file.file_name, &file.content);
         if saved.is_none() {
-            self.log(format!("échec de l'enregistrement de {}", file.file_name));
+            self.log(format!("failed to save {}", file.file_name));
         }
         let id = uuid_line_id();
         self.try_cache_image(ctx, &id, &file.mime_type, &file.content);
@@ -962,7 +984,7 @@ impl BitchatApp {
     fn pick_and_send_file(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("images", &["jpg", "jpeg", "png", "gif", "webp", "bmp"])
-            .add_filter("vidéos", &["mp4", "mov", "webm", "3gp"])
+            .add_filter("videos", &["mp4", "mov", "webm", "3gp"])
             .add_filter("documents", &["pdf", "txt", "md", "zip"])
             .pick_file()
         else {
@@ -971,9 +993,9 @@ impl BitchatApp {
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "fichier".to_string());
+            .unwrap_or_else(|| "file".to_string());
         let Ok(bytes) = std::fs::read(&path) else {
-            self.log(format!("lecture impossible: {name}"));
+            self.log(format!("cannot read: {name}"));
             return;
         };
         let mime = mime_of(&path);
@@ -993,7 +1015,7 @@ impl BitchatApp {
                     }
                     None => {
                         self.popup = Some(format!(
-                            "❌ {name}\n\nImpossible de réduire l'image sous {} (mesh v1).",
+                            "❌ {name}\n\nCannot shrink the image below {} (mesh v1).",
                             human_size(MAX_FILE_CONTENT_BYTES as i64)
                         ));
                         return;
@@ -1011,7 +1033,7 @@ impl BitchatApp {
             // Modal popup: an inline chat line was easy to miss for a
             // rejected upload.
             self.popup = Some(format!(
-                "❌ {name}\n\nTrop gros pour le mesh v1 ({} > {}).\nEssayez un document plus petit.",
+                "❌ {name}\n\nToo large for mesh v1 ({} > {}).\nTry a smaller file.",
                 human_size(bytes.len() as i64),
                 human_size(MAX_FILE_CONTENT_BYTES as i64)
             ));
@@ -1111,7 +1133,7 @@ impl BitchatApp {
             );
             if ui
                 .button("ok")
-                .on_hover_text("appliquer le pseudo")
+                .on_hover_text("apply nickname")
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
                 || (response.lost_focus()
@@ -1138,7 +1160,7 @@ impl BitchatApp {
                 BG,
                 ROW_SELECTED,
             )
-                .on_hover_text("changer le pseudo")
+                .on_hover_text("change nickname")
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
@@ -1159,7 +1181,7 @@ impl BitchatApp {
             |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} / canal commun",
+                        "{} / common channel",
                         if channel_selected { ">" } else { " " }
                     ))
                     .color(if channel_selected { GREEN } else { TEXT }),
@@ -1218,7 +1240,6 @@ impl BitchatApp {
                     {
                         pick = Some(Selection::Peer(peer.peer_id.clone()));
                     }
-                    ui.add_space(2.0);
                 }
             });
         if let Some(selection) = pick {
@@ -1262,14 +1283,14 @@ impl BitchatApp {
                 let Some(lines) = self.chat.get(key) else {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("-- aucun message --").color(TEXT_TERTIARY));
+                        ui.label(egui::RichText::new("-- no messages --").color(TEXT_TERTIARY));
                     });
                     return;
                 };
                 if lines.is_empty() {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("-- aucun message --").color(TEXT_TERTIARY));
+                        ui.label(egui::RichText::new("-- no messages --").color(TEXT_TERTIARY));
                     });
                 }
                 for line in lines {
@@ -1322,7 +1343,7 @@ impl BitchatApp {
                 } else {
                     let text = format!("📎 {name} · {} · {mime}", human_size(*size));
                     let galley = ui.fonts(|f| f.layout(text, body_font(ui), TEXT, wrap_width));
-                    // Chip + the trailing "ouvrir" button.
+                    // Chip + the trailing "open" button.
                     let width = galley.size().x + 64.0;
                     ContentSize {
                         width,
@@ -1587,7 +1608,7 @@ impl BitchatApp {
                                 .sense(egui::Sense::click())
                                 .corner_radius(egui::CornerRadius::same(8)),
                         )
-                        .on_hover_text(format!("{name} — cliquer : aperçu · double-cliquer : ouvrir"))
+                        .on_hover_text(format!("{name} — click: preview · double-click: open"))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if response.double_clicked() {
                         // Keep the external viewer on double-click.
@@ -1611,7 +1632,7 @@ impl BitchatApp {
                             );
                         });
                         if ui
-                            .small_button("ouvrir")
+                            .small_button("open")
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -1694,7 +1715,7 @@ impl BitchatApp {
                             "Broadcasts reach the whole mesh; private messages use a Noise session",
                         ] {
                             ui.horizontal(|ui| {
-                                status_dot(ui, TEXT_TERTIARY);
+                                status_dot_sized(ui, TEXT_TERTIARY, small_font(ui).size);
                                 ui.add_space(6.0);
                                 ui.label(egui::RichText::new(hint).small().color(TEXT));
                             });
@@ -1769,9 +1790,9 @@ impl BitchatApp {
                         let count = self.count_downloads();
                         let armed = self.confirm_clear_downloads;
                         let state = if armed {
-                            "tout supprimer ?"
+                            "delete all?"
                         } else {
-                            "nettoyer ▸"
+                            "clean ▸"
                         };
                         let state_color = if armed { AMBER } else { GREEN };
                         let state_font = small_font(ui);
@@ -1791,15 +1812,15 @@ impl BitchatApp {
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
                                         ui.label(
-                                            egui::RichText::new("Téléchargements")
+                                            egui::RichText::new("Downloads")
                                                 .color(TEXT)
                                                 .strong(),
                                         );
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(format!(
-                                                    "{count} fichier(s) dans bitchatd_downloads — \
-                                                     tout effacer sauf .gitkeep"
+                                                    "{count} file(s) in bitchatd_downloads — \
+                                                     wipes everything but .gitkeep"
                                                 ))
                                                 .small()
                                                 .color(TEXT_TERTIARY),
@@ -1820,7 +1841,7 @@ impl BitchatApp {
                             if armed {
                                 let removed = self.clear_downloads();
                                 self.log(format!(
-                                    "{removed} fichier(s) supprimé(s) de bitchatd_downloads"
+                                    "removed {removed} file(s) from bitchatd_downloads"
                                 ));
                                 self.confirm_clear_downloads = false;
                             } else {
@@ -1828,9 +1849,9 @@ impl BitchatApp {
                             }
                         }
                         dl_click.on_hover_text(if armed {
-                            "cliquer à nouveau pour tout supprimer"
+                            "click again to delete everything"
                         } else {
-                            "nettoyer le dossier de téléchargements"
+                            "clean the downloads folder"
                         });
                         ui.add_space(SETTINGS_ROW_GAP);
                         settings_row(
@@ -2047,7 +2068,7 @@ impl BitchatApp {
                             dot,
                             format!("@{} · {}", peer.nickname, &peer.peer_id[..8]).as_str(),
                             if peer.has_session {
-                                "session chiffree [tls]"
+                                "encrypted session [tls]"
                             } else if peer.verified {
                                 "verified, handshake pending"
                             } else {
@@ -2138,7 +2159,7 @@ impl BitchatApp {
                                                     address: entry.address.clone(),
                                                 });
                                                 self.log(format!(
-                                                    "connexion forcee vers {}",
+                                                    "forced connection to {}",
                                                     entry.address
                                                 ));
                                             }
@@ -2291,7 +2312,7 @@ impl eframe::App for BitchatApp {
                     INPUT_SURFACE,
                     HOVER_DARK,
                 )
-                    .on_hover_text("envoyer une image, une vidéo ou un document (≤ 96 Ko sur le mesh v1)")
+                    .on_hover_text("send an image, video or document (≤ 96 KB over mesh v1)")
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -2328,7 +2349,7 @@ impl eframe::App for BitchatApp {
                     GREEN,
                     GREEN.gamma_multiply(1.35),
                 )
-                    .on_hover_text("envoyer (Entree)")
+                    .on_hover_text("send (Enter)")
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked();
                 if (send || enter) && !self.draft.trim().is_empty() {
@@ -2342,8 +2363,8 @@ impl eframe::App for BitchatApp {
             let (key, title, subtitle) = match &self.selected {
                 Selection::Broadcast => (
                     CHANNEL_KEY.to_string(),
-                    "canal commun".to_string(),
-                    "mesh-wide · non chiffre".to_string(),
+                    "common channel".to_string(),
+                    "mesh-wide · not encrypted".to_string(),
                 ),
                 Selection::Peer(peer_id) => {
                     let session = self
@@ -2354,9 +2375,9 @@ impl eframe::App for BitchatApp {
                         peer_id.clone(),
                         format!("@{}", self.nickname_of(peer_id)),
                         if session {
-                            format!("{} · session chiffree [tls]", &peer_id[..8])
+                            format!("{} · encrypted session [tls]", &peer_id[..8])
                         } else {
-                            format!("{} · en attente de session…", &peer_id[..8])
+                            format!("{} · waiting for session…", &peer_id[..8])
                         },
                     )
                 }
@@ -2384,54 +2405,49 @@ impl eframe::App for BitchatApp {
             self.show_debug_window(ctx);
         }
 
-        // Full-screen image preview: dark backdrop (click beside the image
-        // closes), centered window with the texture, Échap also closes.
+        // Full-screen image preview. A single Area: shapes paint in call
+        // order within a layer, so the veil drawn first can never cover the
+        // image (two Areas of equal Order are instead ordered by id hash,
+        // which is what put the veil on top before). Click anywhere or Esc
+        // closes.
         if let Some(id) = self.preview_line.clone() {
             if let Some(image) = self.image_cache.get(&id) {
                 let screen = ctx.screen_rect();
                 let [w, h] = image.size;
                 let scale = (screen.width() * 0.9 / w as f32)
-                    .min(screen.height() * 0.82 / h as f32);
+                    .min(screen.height() * 0.8 / h as f32);
                 let display = egui::vec2(w as f32 * scale, h as f32 * scale);
                 let mut close = false;
-                egui::Area::new(egui::Id::new("preview_backdrop"))
+                egui::Area::new(egui::Id::new("image_preview"))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        let (rect, response) =
+                        let (bg, bg_response) =
                             ui.allocate_exact_size(screen.size(), egui::Sense::click());
                         ui.painter()
-                            .rect_filled(rect, 0, egui::Color32::from_black_alpha(210));
-                        if response.clicked() {
+                            .rect_filled(bg, 0, egui::Color32::from_black_alpha(210));
+                        let img_rect = egui::Rect::from_center_size(
+                            screen.center() - egui::vec2(0.0, 10.0),
+                            display,
+                        );
+                        ui.painter().image(
+                            image.texture.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        ui.painter().text(
+                            img_rect.center_bottom() + egui::vec2(0.0, 16.0),
+                            egui::Align2::CENTER_CENTER,
+                            "click anywhere or press Esc to close",
+                            small_font(ui),
+                            TEXT_TERTIARY,
+                        );
+                        if bg_response.clicked() {
                             close = true;
                         }
-                    });
-                // Foreground order: the backdrop Area below is also
-                // Foreground, and within an order later painters win — the
-                // window must come after or the veil covers the image.
-                egui::Window::new("image_preview")
-                    .order(egui::Order::Foreground)
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .movable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                    .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
-                    .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add(
-                                egui::Image::new(egui::load::SizedTexture::new(
-                                    image.texture.id(),
-                                    display,
-                                ))
-                                .corner_radius(egui::CornerRadius::same(8)),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("clic à côté ou Échap pour fermer")
-                                    .small()
-                                    .color(TEXT_TERTIARY),
-                            );
-                        });
                     });
                 if close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
                     self.preview_line = None;
@@ -2441,47 +2457,66 @@ impl eframe::App for BitchatApp {
             }
         }
 
-        // Modal popup (upload rejections…): backdrop click or OK dismisses.
+        // Modal popup (upload rejections…): one Area, veil first then the
+        // message box; backdrop click or OK dismisses.
         if let Some(message) = self.popup.clone() {
             let screen = ctx.screen_rect();
             let mut close = false;
-            egui::Area::new(egui::Id::new("popup_backdrop"))
+            egui::Area::new(egui::Id::new("popup"))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    let (rect, response) =
+                    let (bg, bg_response) =
                         ui.allocate_exact_size(screen.size(), egui::Sense::click());
                     ui.painter()
-                        .rect_filled(rect, 0, egui::Color32::from_black_alpha(190));
-                    if response.clicked() {
-                        close = true;
-                    }
-                });
-            egui::Window::new("bitchatd · envoi impossible")
-                .order(egui::Order::Foreground)
-                .collapsible(false)
-                .resizable(false)
-                .movable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.set_max_width(440.0);
-                    ui.add(egui::Label::new(egui::RichText::new(&message).color(TEXT)).wrap());
-                    ui.add_space(SETTINGS_ROW_GAP);
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
+                        .rect_filled(bg, 0, egui::Color32::from_black_alpha(190));
+                    let box_rect = egui::Rect::from_center_size(
+                        screen.center(),
+                        egui::vec2(470.0, 170.0),
+                    );
+                    ui.allocate_new_ui(
+                        egui::UiBuilder::new().max_rect(box_rect),
                         |ui| {
-                            if themed_button(
-                                ui,
-                                egui::Button::new(egui::RichText::new("OK")),
-                                GREEN,
-                                GREEN.gamma_multiply(1.35),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                            {
-                                close = true;
-                            }
+                            egui::Frame::new()
+                                .fill(SURFACE)
+                                .corner_radius(10)
+                                .inner_margin(egui::Margin::symmetric(16, 14))
+                                .show(ui, |ui| {
+                                    ui.set_max_width(430.0);
+                                    ui.label(
+                                        egui::RichText::new("⚠ upload rejected")
+                                            .color(AMBER)
+                                            .strong(),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&message).color(TEXT),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.add_space(SETTINGS_ROW_GAP);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if themed_button(
+                                                ui,
+                                                egui::Button::new(egui::RichText::new("OK")),
+                                                GREEN,
+                                                GREEN.gamma_multiply(1.35),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .clicked()
+                                            {
+                                                close = true;
+                                            }
+                                        },
+                                    );
+                                });
                         },
                     );
+                    if bg_response.clicked() {
+                        close = true;
+                    }
                 });
             if close {
                 self.popup = None;

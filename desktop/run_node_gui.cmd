@@ -7,4 +7,7 @@ rem   powershell -Command "Add-AppxPackage -Path '%~dp0sparse\AppxManifest.xml' 
 set BITCHATD_DEBUG_HEX=1
 cd /d "%~dp0"
 copy /y "sparse\node_gui.exe.manifest" "target\debug\examples\" >nul
+rem The package manifest references Assets\StoreLogo.png (taskbar / Explorer
+rem tile); it resolves against the external location, so keep a copy there.
+xcopy /y /i "sparse\Assets" "target\debug\examples\Assets\" >nul
 cargo run -q -p bitchat-node --example node_gui >> "%TEMP%\bitchatd_gui.log" 2>&1
