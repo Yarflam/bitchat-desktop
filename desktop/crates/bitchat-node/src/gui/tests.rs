@@ -44,6 +44,7 @@ fn text_line(who: &str, author_id: &str, mine: bool, text: &str, ts_millis: i64)
         mine,
         content: ChatContent::Text(text.to_string()),
         ts_millis,
+        confirmed: false,
     }
 }
 

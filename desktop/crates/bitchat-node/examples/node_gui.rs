@@ -10,6 +10,21 @@ use std::thread;
 use bitchat_node::gui::{egui, parse_mac, terminal_style, BitchatApp, UiCommand};
 use bitchat_node::{LinkEvent, MeshLink, NodeIdentity};
 
+/// Launcher icon (green block glyph) embedded at compile time, so the
+/// window, the taskbar button and the Alt-Tab switcher all show it.
+fn window_icon() -> egui::IconData {
+    let png = include_bytes!("../assets/bitchatd.png");
+    let image = image::load_from_memory(png)
+        .expect("embedded assets/bitchatd.png icon decodes")
+        .to_rgba8();
+    let (width, height) = (image.width(), image.height());
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let identity_path = PathBuf::from(
         std::env::var("BITCHATD_IDENTITY").unwrap_or_else(|_| "bitchatd.identity".to_string()),
@@ -177,7 +192,10 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1160.0, 760.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            // Same launcher icon as the Android app, in the title bar and
+            // the Windows taskbar.
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(

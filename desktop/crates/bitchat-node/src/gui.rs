@@ -248,6 +248,8 @@ struct ChatLine {
     content: ChatContent,
     /// Epoch milliseconds; rendered `HH:mm` today, `dd/MM/yyyy HH:mm` older.
     ts_millis: i64,
+    /// Own message acked by the peer (green tick, Android parity).
+    confirmed: bool,
 }
 
 /// Dynamic chat timestamp, mirroring the mobile app: compact `HH:mm` for
@@ -406,15 +408,22 @@ pub struct BitchatApp {
     preview_line: Option<String>,
     /// Two-step confirm arm for the "clean downloads" action.
     confirm_clear_downloads: bool,
+    /// Unread message counts per conversation key (badge in the peer list).
+    unread: HashMap<String, usize>,
+    /// Modal message shown on top of everything (upload rejections…).
+    popup: Option<String>,
 }
 
 const MAX_LOG_LINES: usize = 60;
 
+/// Uniform vertical gap between settings elements (rows and sections alike).
+const SETTINGS_ROW_GAP: f32 = 8.0;
+
 /// Section label in the settings windows, like `AboutSectionLabel`.
 fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(10.0);
+    ui.add_space(SETTINGS_ROW_GAP);
     ui.label(egui::RichText::new(text).color(GREEN).strong());
-    ui.add_space(4.0);
+    ui.add_space(SETTINGS_ROW_GAP);
 }
 
 /// Shared fixed-width settings-row container (identical geometry for every
@@ -506,8 +515,50 @@ fn settings_row(
             ui.label(egui::RichText::new(state).small().color(state_color));
         });
     });
-    // padding-top of the next element: keep the boxes visually separated
-    ui.add_space(8.0);
+    // Same gap after every row keeps the stack rhythm uniform.
+    ui.add_space(SETTINGS_ROW_GAP);
+}
+
+/// Full-width selectable row for the conversation list (channel + peers):
+/// the hit zone spans the whole panel width, the background is chosen
+/// before the content is painted so hover highlights properly, and an
+/// unread counter (when > 0) hugs the right edge like the mobile badges.
+fn peer_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    unread: usize,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let row_h = ui.fonts(|f| f.row_height(&body_font(ui))) + 16.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+    let hovered = response.hovered() || response.is_pointer_button_down_on();
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(8),
+        if selected || hovered { ROW_SELECTED } else { BG },
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 8.0))),
+        |ui| {
+            ui.horizontal(|ui| {
+                add_contents(ui);
+                if unread > 0 {
+                    // Right-align the badge by consuming the remaining gap.
+                    let remaining = ui.available_width();
+                    ui.allocate_space(egui::vec2((remaining - 20.0).max(0.0), 1.0));
+                    ui.label(
+                        egui::RichText::new(format!("{unread}"))
+                            .small()
+                            .strong()
+                            .color(BG)
+                            .background_color(GREEN),
+                    );
+                }
+            });
+        },
+    );
+    response
 }
 
 impl BitchatApp {
@@ -593,6 +644,13 @@ impl BitchatApp {
             }
             LinkEvent::Delivered { peer_id, .. } => {
                 self.log(format!("delivre a {} ✓", self.nickname_of(&peer_id)));
+                // Ack the most recent own line of that conversation: the
+                // tick right of its timestamp turns green (Android parity).
+                if let Some(lines) = self.chat.get_mut(&peer_id) {
+                    if let Some(line) = lines.iter_mut().rev().find(|line| line.mine) {
+                        line.confirmed = true;
+                    }
+                }
             }
             LinkEvent::PeerStateSent { peer_id } => {
                 self.log(format!(
@@ -673,6 +731,21 @@ impl BitchatApp {
             )
     }
 
+    /// Current conversation key (CHANNEL_KEY for the mesh-wide channel).
+    fn selected_key(&self) -> String {
+        match &self.selected {
+            Selection::Broadcast => CHANNEL_KEY.to_string(),
+            Selection::Peer(peer_id) => peer_id.clone(),
+        }
+    }
+
+    /// Count messages that arrive while their conversation is not open.
+    fn bump_unread(&mut self, key: &str) {
+        if key != self.selected_key() {
+            *self.unread.entry(key.to_string()).or_insert(0) += 1;
+        }
+    }
+
     fn push_line(&mut self, key: &str, who: &str, text: String) {
         let author_id = self
             .peers
@@ -680,6 +753,7 @@ impl BitchatApp {
             .find(|peer| peer.nickname == who)
             .map(|peer| peer.peer_id.clone())
             .unwrap_or_else(|| who.to_string());
+        self.bump_unread(key);
         self.chat.entry(key.to_string()).or_default().push(ChatLine {
             id: uuid_line_id(),
             who: who.to_string(),
@@ -687,6 +761,7 @@ impl BitchatApp {
             mine: false,
             content: ChatContent::Text(text),
             ts_millis: now_millis(),
+            confirmed: false,
         });
     }
 
@@ -698,6 +773,7 @@ impl BitchatApp {
             mine: true,
             content,
             ts_millis: now_millis(),
+            confirmed: false,
         });
     }
 
@@ -716,6 +792,7 @@ impl BitchatApp {
         }
         let id = uuid_line_id();
         self.try_cache_image(ctx, &id, &file.mime_type, &file.content);
+        self.bump_unread(key);
         self.chat.entry(key.to_string()).or_default().push(ChatLine {
             id,
             who: who.to_string(),
@@ -729,6 +806,7 @@ impl BitchatApp {
                 saved,
             },
             ts_millis: now_millis(),
+            confirmed: false,
         });
     }
 
@@ -828,15 +906,6 @@ impl BitchatApp {
             .spawn();
     }
 
-    /// Post a visible error line in the current conversation.
-    fn push_system_line(&mut self, text: String) {
-        let key = match &self.selected {
-            Selection::Broadcast => CHANNEL_KEY.to_string(),
-            Selection::Peer(peer_id) => peer_id.clone(),
-        };
-        self.push_own_line(&key, ChatContent::Text(text));
-    }
-
     /// Re-encode an image so it fits the mesh v1 wire budget: shrinking
     /// thumbnail (never upscaling) + JPEG quality steps, mirroring the phone
     /// media pipeline's compression. Returns None when it cannot fit.
@@ -896,8 +965,8 @@ impl BitchatApp {
                         (jpeg, "image/jpeg".to_string(), jpg_name)
                     }
                     None => {
-                        self.push_system_line(format!(
-                            "❌ {name}: impossible de réduire l'image sous {} (mesh v1)",
+                        self.popup = Some(format!(
+                            "❌ {name}\n\nImpossible de réduire l'image sous {} (mesh v1).",
                             human_size(MAX_FILE_CONTENT_BYTES as i64)
                         ));
                         return;
@@ -912,8 +981,10 @@ impl BitchatApp {
         };
 
         if bytes.len() as u64 > MAX_FILE_CONTENT_BYTES {
-            self.push_system_line(format!(
-                "❌ {name}: trop gros pour le mesh v1 ({} > {}). Essayez un document plus petit.",
+            // Modal popup: an inline chat line was easy to miss for a
+            // rejected upload.
+            self.popup = Some(format!(
+                "❌ {name}\n\nTrop gros pour le mesh v1 ({} > {}).\nEssayez un document plus petit.",
                 human_size(bytes.len() as i64),
                 human_size(MAX_FILE_CONTENT_BYTES as i64)
             ));
@@ -952,6 +1023,7 @@ impl BitchatApp {
                 saved,
             },
             ts_millis: now_millis(),
+            confirmed: false,
         });
         self.log(format!("envoi de {}…", file.file_name));
         self.focus_composer = true;
@@ -1052,30 +1124,24 @@ impl BitchatApp {
     fn show_peer_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         let channel_selected = self.selected == Selection::Broadcast;
-        let channel_row = egui::Frame::new()
-            .fill(if channel_selected { ROW_SELECTED } else { BG })
-            .corner_radius(8)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
+        let channel_click = peer_row(
+            ui,
+            channel_selected,
+            self.unread.get(CHANNEL_KEY).copied().unwrap_or(0),
+            |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} / {}",
-                        if channel_selected { ">" } else { " " },
-                        "canal commun"
+                        "{} / canal commun",
+                        if channel_selected { ">" } else { " " }
                     ))
                     .color(if channel_selected { GREEN } else { TEXT }),
                 );
-            })
-            .response;
-        let channel_click = ui
-            .interact(
-                channel_row.rect,
-                egui::Id::new("channel_row"),
-                egui::Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            },
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
         if channel_click.clicked() {
             self.selected = Selection::Broadcast;
+            self.unread.remove(CHANNEL_KEY);
             self.focus_composer = true;
         }
         ui.add_space(6.0);
@@ -1096,42 +1162,43 @@ impl BitchatApp {
                     } else {
                         TEXT_TERTIARY
                     };
-                    let row = egui::Frame::new()
-                        .fill(if selected { ROW_SELECTED } else { BG })
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                status_dot(ui, dot);
+                    let unread = self.unread.get(&peer.peer_id).copied().unwrap_or(0);
+                    let response = peer_row(
+                        ui,
+                        selected,
+                        unread,
+                        |ui| {
+                            status_dot(ui, dot);
+                            ui.label(
+                                egui::RichText::new(format!("@{}", peer.nickname))
+                                    .color(if selected { GREEN } else { TEXT }),
+                            );
+                            if peer.has_session {
                                 ui.label(
-                                    egui::RichText::new(format!("@{}", peer.nickname))
-                                        .color(if selected { GREEN } else { TEXT }),
+                                    egui::RichText::new("[tls]")
+                                        .small()
+                                        .color(TEXT_TERTIARY),
                                 );
-                                if peer.has_session {
-                                    ui.label(
-                                        egui::RichText::new("[tls]")
-                                            .small()
-                                            .color(TEXT_TERTIARY),
-                                    );
-                                }
-                            });
-                        })
-                        .response;
-                    let click = ui
-                        .interact(
-                            row.rect,
-                            egui::Id::new(("peer_row", peer.peer_id.clone())),
-                            egui::Sense::click(),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if click.clicked() {
+                            }
+                        },
+                    );
+                    if response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(peer.peer_id.clone())
+                        .clicked()
+                    {
                         pick = Some(Selection::Peer(peer.peer_id.clone()));
                     }
-                    row.on_hover_text(peer.peer_id.clone());
+                    ui.add_space(2.0);
                 }
             });
         if let Some(selection) = pick {
+            let key = match &selection {
+                Selection::Broadcast => CHANNEL_KEY.to_string(),
+                Selection::Peer(peer_id) => peer_id.clone(),
+            };
             self.selected = selection;
+            self.unread.remove(&key);
             self.focus_composer = true;
         }
 
@@ -1260,9 +1327,20 @@ impl BitchatApp {
         let max_bubble = (row_width * BUBBLE_MAX_FRACTION).max(140.0);
         let inner_max = (max_bubble - BUBBLE_PAD_H * 2.0).max(60.0);
         let time_font = small_font(ui);
-        let time_w = ui.fonts(|f| f.layout_no_wrap(time.clone(), time_font, time_color).size().x);
+        let time_w = ui.fonts(|f| f.layout_no_wrap(time.clone(), time_font.clone(), time_color).size().x);
+        // Own messages carry a delivery tick right of the timestamp (Android
+        // parity): grey when sent, green once the peer acked delivery.
+        let tick_w = if line.mine {
+            ui.fonts(|f| {
+                f.layout_no_wrap("✓".to_string(), time_font, TEXT_TERTIARY)
+                    .size()
+                    .x
+            }) + 4.0
+        } else {
+            0.0
+        };
         let body = self.content_galley(ui, line, inner_max);
-        let same_line = body.last_right + TIME_GAP + time_w <= inner_max;
+        let same_line = body.last_right + TIME_GAP + time_w + tick_w <= inner_max;
         // The nickname heads other users' bubbles and can be wider than the
         // body — include it so a long handle never wraps mid-bubble.
         let nick_w = if line.mine {
@@ -1274,9 +1352,9 @@ impl BitchatApp {
         // like the mobile layout — the Frame would otherwise stretch to the
         // full max width in a top-down layout.
         let content_w = if same_line {
-            body.last_right.max(nick_w) + TIME_GAP + time_w
+            body.last_right.max(nick_w) + TIME_GAP + time_w + tick_w
         } else {
-            body.width.max(nick_w).max(time_w)
+            body.width.max(nick_w).max(time_w + tick_w)
         };
         // Slack: measured galleys under-report rendered text by a few px;
         // without it the timestamp could bleed past the bubble's right edge.
@@ -1317,7 +1395,7 @@ impl BitchatApp {
                         // Timestamp rides the last body line: explicit
                         // fixed-size left-to-right band (an inherited
                         // right-aligned layout would flip the order).
-                        let band_w = (body.last_right + TIME_GAP + time_w + 8.0)
+                        let band_w = (body.last_right + TIME_GAP + time_w + tick_w + 8.0)
                             .min((bubble_w - BUBBLE_PAD_H * 2.0 - 2.0).max(60.0));
                         ui.allocate_ui_with_layout(
                             egui::vec2(band_w, body.height.max(14.0)),
@@ -1330,6 +1408,16 @@ impl BitchatApp {
                                 ui.label(
                                     egui::RichText::new(&time).small().color(time_color),
                                 );
+                                if line.mine {
+                                    let tick_color = if line.confirmed {
+                                        GREEN
+                                    } else {
+                                        time_color
+                                    };
+                                    ui.label(
+                                        egui::RichText::new("✓").small().color(tick_color),
+                                    );
+                                }
                             },
                         );
                     } else {
@@ -1346,6 +1434,16 @@ impl BitchatApp {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.label(egui::RichText::new(&time).small().color(time_color));
+                                if line.mine {
+                                    let tick_color = if line.confirmed {
+                                        GREEN
+                                    } else {
+                                        time_color
+                                    };
+                                    ui.label(
+                                        egui::RichText::new("✓").small().color(tick_color),
+                                    );
+                                }
                             },
                         );
                     }
@@ -1377,9 +1475,18 @@ impl BitchatApp {
             let galley = f.layout_no_wrap(nick_text.clone(), body_font(ui), TEXT);
             (galley.size().x, galley.size().y)
         });
+        let tick_w = if line.mine {
+            ui.fonts(|f| {
+                f.layout_no_wrap("✓".to_string(), small_font(ui), TEXT_TERTIARY)
+                    .size()
+                    .x
+            }) + 4.0
+        } else {
+            0.0
+        };
         let column_w = nick_w.max(body.width);
         let column_h = nick_h + 1.0 + body.height;
-        let row_w = 4.0 + column_w + 10.0 + time_w;
+        let row_w = 4.0 + column_w + 10.0 + time_w + tick_w;
         let row_h = column_h.max(time_h);
         ui.allocate_ui_with_layout(
             egui::vec2(row_w, row_h),
@@ -1395,6 +1502,14 @@ impl BitchatApp {
                 });
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new(time).small().color(TEXT_TERTIARY));
+                if line.mine {
+                    let tick_color = if line.confirmed {
+                        GREEN
+                    } else {
+                        TEXT_TERTIARY
+                    };
+                    ui.label(egui::RichText::new("✓").small().color(tick_color));
+                }
             },
         );
         preview_request
@@ -1434,8 +1549,15 @@ impl BitchatApp {
                     let display = egui::vec2(w as f32 * scale, h as f32 * scale);
                     let sized =
                         egui::load::SizedTexture::new(image.texture.id(), display);
+                    // `Image` defaults to Sense::hover(): without an explicit
+                    // click sense, `clicked()` never fires and the preview
+                    // cannot open.
                     let response = ui
-                        .add(egui::Image::new(sized).corner_radius(egui::CornerRadius::same(8)))
+                        .add(
+                            egui::Image::new(sized)
+                                .sense(egui::Sense::click())
+                                .corner_radius(egui::CornerRadius::same(8)),
+                        )
                         .on_hover_text(format!("{name} — cliquer : aperçu · double-cliquer : ouvrir"))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if response.double_clicked() {
@@ -1681,6 +1803,7 @@ impl BitchatApp {
                         } else {
                             "nettoyer le dossier de téléchargements"
                         });
+                        ui.add_space(SETTINGS_ROW_GAP);
                         settings_row(
                             ui,
                             BLUE,
@@ -2285,6 +2408,52 @@ impl eframe::App for BitchatApp {
             }
         }
 
+        // Modal popup (upload rejections…): backdrop click or OK dismisses.
+        if let Some(message) = self.popup.clone() {
+            let screen = ctx.screen_rect();
+            let mut close = false;
+            egui::Area::new(egui::Id::new("popup_backdrop"))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0, egui::Color32::from_black_alpha(190));
+                    if response.clicked() {
+                        close = true;
+                    }
+                });
+            egui::Window::new("bitchatd · envoi impossible")
+                .collapsible(false)
+                .resizable(false)
+                .movable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&message).color(TEXT)).wrap());
+                    ui.add_space(SETTINGS_ROW_GAP);
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if themed_button(
+                                ui,
+                                egui::Button::new(egui::RichText::new("OK")),
+                                GREEN,
+                                GREEN.gamma_multiply(1.35),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                            {
+                                close = true;
+                            }
+                        },
+                    );
+                });
+            if close {
+                self.popup = None;
+            }
+        }
+
         // No global cursor override: egui already shows the hand over real
         // click targets; `is_pointer_over_area` is true for the whole window
         // (every panel is an "area"), which painted a pointer everywhere.
@@ -2351,6 +2520,8 @@ impl BitchatApp {
             image_cache: HashMap::new(),
             preview_line: None,
             confirm_clear_downloads: false,
+            unread: HashMap::new(),
+            popup: None,
         }
     }
 }
