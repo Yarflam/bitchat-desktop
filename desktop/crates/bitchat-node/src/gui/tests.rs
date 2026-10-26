@@ -79,10 +79,6 @@ fn bounds(node: &egui_kittest::kittest::Node<'_>) -> Bounds {
     }
 }
 
-fn overlaps(a: &Bounds, b: &Bounds) -> bool {
-    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
-}
-
 /// The central-panel copy of a label (the peer list also shows `@nick`).
 fn central_label(harness: &mut Harness<'_, BitchatApp>, text: &str) -> Bounds {
     harness
@@ -241,27 +237,32 @@ fn matrix_time_sits_immediately_right_of_text_bottom() {
 }
 
 #[test]
-fn settings_chat_layout_toggle_does_not_overlap_its_row() {
+fn settings_chat_layout_toggle_stays_in_the_right_zone() {
     let app = fixture_app(ChatTheme::Bubbles, Vec::new());
     let mut app = app;
     app.show_settings = true;
     app.settings_tab = SettingsTab::Settings;
     let harness = harness_for(app);
 
-    // Compare against the actual painted text extents (the smallest matching
-    // node is the TextRun; the Label widget rect fills its whole column).
-    let subtitle = harness
-        .query_all_by_label_contains("terminal transcript")
-        .map(|node| bounds(&node))
-        .min_by(|a, b| (a.right - a.left).total_cmp(&(b.right - b.left)))
-        .expect("chat layout subtitle text");
-    let toggle = bounds(&harness.get_by_label("Bubbles"));
-
+    // The subtitle is painted (not a Label widget) since the ink-exact row
+    // rewrite, so this guards the toggle geometry directly: one ordered
+    // segmented control, flush with the capped row's right padding and
+    // clear of the text column. The settings window (default 600 px) opens
+    // centered in the canvas and rows are at most SETTINGS_ROW_MAX_WIDTH.
+    let bubbles = bounds(&harness.get_by_label("Bubbles"));
+    let matrix = bounds(&harness.get_by_label("Matrix"));
     assert!(
-        !overlaps(&subtitle, &toggle),
-        "toggle must not overlap the subtitle text: subtitle={:?} toggle={:?}",
-        subtitle,
-        toggle
+        (bubbles.top - matrix.top).abs() <= 2.0,
+        "toggle segments share one row: bubbles={matrix:?} matrix={matrix:?}"
+    );
+    assert!(bubbles.left < matrix.left, "segments ordered left to right");
+    assert!(
+        bubbles.left > TEST_WIDTH * 0.5,
+        "toggle must sit in the right half, clear of the title text: {bubbles:?}"
+    );
+    assert!(
+        matrix.right <= TEST_WIDTH * 0.5 + SETTINGS_ROW_MAX_WIDTH / 2.0 + 2.0,
+        "toggle must hug the row's right padding: {matrix:?}"
     );
 }
 
@@ -271,19 +272,37 @@ fn settings_chat_layout_toggle_does_not_overlap_its_row() {
 #[test]
 fn visual_snapshots_for_review() {
     let ts = 1_700_000_500_000;
-    let app = fixture_app(
+    let mut app = fixture_app(
         ChatTheme::Bubbles,
         vec![
             text_line("moi", "me", true, "message perso court", ts - 60_000),
             text_line(
-                "pseudo-tres-long-pour-le-test",
+                "very-long-nickname-for-the-test",
                 "peer55",
                 false,
-                "reçu avec un pseudo long",
+                "received with a long nickname",
                 ts,
             ),
         ],
     );
+    // Populate the conversation list so the snapshot covers the peer rows
+    // (full-width hit zones, hover fill, unread badges).
+    app.peers = vec![
+        PeerInfo {
+            peer_id: "2a6a0d41451fbe94".to_string(),
+            nickname: "alice".to_string(),
+            verified: true,
+            has_session: true,
+        },
+        PeerInfo {
+            peer_id: "8f01cdef2200ab".to_string(),
+            nickname: "bob-long-nickname".to_string(),
+            verified: false,
+            has_session: false,
+        },
+    ];
+    app.selected = Selection::Peer("8f01cdef2200ab".to_string());
+    app.unread.insert("2a6a0d41451fbe94".to_string(), 3);
     let mut harness = harness_for(app);
     let _ = harness.try_snapshot("visual_bubbles");
 

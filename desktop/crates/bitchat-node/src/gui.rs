@@ -180,28 +180,154 @@ fn mime_of(path: &std::path::Path) -> String {
     }
 }
 
-/// Vertical distance from the allocation top to the dot center, tuned for
-/// the bundled monospace font: its line box is much taller than the glyphs
-/// (~11 px of top bearing at 14.5 pt), so centering the 16 px allocation
-/// puts the dot far above the visible text.
-fn dot_center_offset(font_size: f32) -> f32 {
-    1.24 * font_size
+/// Lay out rich text exactly like a `Label` would (same font resolution,
+/// including `.small()` / `.strong()` overrides), optionally wrapped.
+fn layout_rich(
+    ui: &egui::Ui,
+    text: impl Into<egui::WidgetText> + Clone,
+    wrap: bool,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let text: egui::WidgetText = text.into();
+    text.into_galley(
+        ui,
+        Some(if wrap {
+            egui::TextWrapMode::Wrap
+        } else {
+            egui::TextWrapMode::Extend
+        }),
+        wrap_width,
+        egui::FontSelection::Style(egui::TextStyle::Body),
+    )
 }
 
-/// Small status dot, centered on the visible glyphs of the neighbouring
-/// text line rather than on the widget allocation.
-fn status_dot_sized(ui: &mut egui::Ui, color: egui::Color32, font_size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
-    ui.painter().circle_filled(
-        egui::pos2(rect.center().x, rect.top() + dot_center_offset(font_size)),
-        4.0,
-        color,
-    );
+/// Paint rich text so its *visible ink* lands at `anchor` (LEFT: ink
+/// top-left corner; CENTER: horizontally centered on anchor.x; RIGHT: ink
+/// right edge at anchor.x). The bundled monospace font's line box is ~19 px
+/// tall for ~12 px of glyphs, so widget-based layout parks the text at the
+/// bottom of its allocation and leaves dead space above it; painting by
+/// `mesh_bounds` puts the ink exactly where asked. Returns the ink rect.
+fn paint_text_top(
+    ui: &mut egui::Ui,
+    anchor: egui::Pos2,
+    text: impl Into<egui::WidgetText> + Clone,
+    wrap: bool,
+    wrap_width: f32,
+    halign: egui::Align,
+) -> egui::Rect {
+    let galley = layout_rich(ui, text, wrap, wrap_width);
+    let ink = galley.mesh_bounds;
+    let x = match halign {
+        egui::Align::RIGHT => anchor.x - ink.right(),
+        egui::Align::Center => anchor.x - ink.center().x,
+        egui::Align::LEFT => anchor.x - ink.left(),
+    };
+    ui.painter()
+        .galley(egui::pos2(x, anchor.y - ink.top()), galley, TEXT);
+    egui::Rect::from_min_size(egui::pos2(x + ink.left(), anchor.y), ink.size())
 }
 
-/// Status dot next to a body-sized label (the common case).
+/// Small status dot, vertically centered on its 16 px allocation (debug
+/// sheet scan rows; settings rows paint their dots directly at glyph level).
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
-    status_dot_sized(ui, color, body_font(ui).size);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// Settings-row box padding. Text is positioned by its visible ink (see
+/// paint_text_top), so these ARE the visual margins.
+const ROW_PAD_H: f32 = 12.0;
+const ROW_PAD_TOP: f32 = 10.0;
+/// Ink-to-ink gap between a row's title and its subtitle.
+const ROW_TEXT_GAP: f32 = 5.0;
+const ROW_PAD_BOTTOM: f32 = 10.0;
+
+/// Allocate a settings-row box of the exact given height at the capped row
+/// width and paint its background. Returns the box rect.
+/// Rows are capped at SETTINGS_ROW_MAX_WIDTH instead of tracking
+/// `available_width()`: egui windows auto-size around their content even
+/// with `resizable(false)`, and feeding the window width back into the row
+/// width made the very first frame stretch the window to the full screen.
+/// A bounded row width keeps the window a constant size by construction.
+fn settings_row_box(ui: &mut egui::Ui, height: f32) -> egui::Rect {
+    let width = ui.available_width().min(SETTINGS_ROW_MAX_WIDTH).max(120.0);
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, height));
+    ui.allocate_space(rect.size());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), SURFACE);
+    rect
+}
+
+/// Settings-row core shared by every row: measures the title/subtitle ink,
+/// allocates the box at the exact content height, paints the status dot on
+/// the title line and the two text lines. Returns the box rect, the inner
+/// content rect and the vertical center of the title ink (for placing a
+/// right-hand control or state label).
+fn settings_row_core(
+    ui: &mut egui::Ui,
+    icon: egui::Color32,
+    title: impl Into<egui::WidgetText> + Clone,
+    subtitle: impl Into<egui::WidgetText> + Clone,
+) -> (egui::Rect, egui::Rect, f32) {
+    let width = ui.available_width().min(SETTINGS_ROW_MAX_WIDTH).max(120.0);
+    let text_x_off = 12.0 + 6.0; // dot column + gap
+    let text_w = (width - ROW_PAD_H * 2.0 - text_x_off).max(60.0);
+    let title_h = layout_rich(ui, title.clone(), false, f32::INFINITY)
+        .mesh_bounds
+        .height();
+    let sub_h = layout_rich(ui, subtitle.clone(), true, text_w)
+        .mesh_bounds
+        .height();
+    let rect = settings_row_box(
+        ui,
+        ROW_PAD_TOP + title_h + ROW_TEXT_GAP + sub_h + ROW_PAD_BOTTOM,
+    );
+    let content = rect.shrink2(egui::vec2(ROW_PAD_H, ROW_PAD_TOP));
+    let text_x = content.left() + text_x_off;
+    // The dot rides the title line, not the vertical center of the block.
+    ui.painter().circle_filled(
+        egui::pos2(content.left() + 4.0, content.top() + title_h / 2.0),
+        4.0,
+        icon,
+    );
+    paint_text_top(
+        ui,
+        egui::pos2(text_x, content.top()),
+        title,
+        false,
+        f32::INFINITY,
+        egui::Align::LEFT,
+    );
+    paint_text_top(
+        ui,
+        egui::pos2(text_x, content.top() + title_h + ROW_TEXT_GAP),
+        subtitle,
+        true,
+        text_w,
+        egui::Align::LEFT,
+    );
+    (rect, content, content.top() + title_h / 2.0)
+}
+
+/// Paint a right-aligned state label vertically centered on `center_y`,
+/// flush with the row's right padding.
+fn settings_row_state(
+    ui: &mut egui::Ui,
+    content: egui::Rect,
+    center_y: f32,
+    state: impl Into<egui::WidgetText> + Clone,
+) {
+    let h = layout_rich(ui, state.clone(), false, f32::INFINITY)
+        .mesh_bounds
+        .height();
+    paint_text_top(
+        ui,
+        egui::pos2(content.right(), center_y - h / 2.0),
+        state,
+        false,
+        f32::INFINITY,
+        egui::Align::RIGHT,
+    );
 }
 
 /// Green block logo, like the app's pixel robot glyph.
@@ -443,58 +569,9 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(SETTINGS_ROW_GAP);
 }
 
-/// Shared fixed-width settings-row container (identical geometry for every
-/// row, including the interactive Chat Layout toggle).
-/// Rows are capped at SETTINGS_ROW_MAX_WIDTH instead of tracking
-/// `available_width()`: egui windows auto-size around their content even
-/// with `resizable(false)`, and feeding the window width back into the row
-/// width made the very first frame stretch the window to the full screen.
-/// A bounded row width keeps the window a constant size by construction.
-/// Returns the painted box so rows can use it as a click target.
-fn settings_row_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
-    let width = ui.available_width().min(SETTINGS_ROW_MAX_WIDTH).max(120.0);
-    let start = ui.cursor().min;
-    let child = ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.0),
-        egui::Layout::top_down(egui::Align::LEFT),
-        |ui| {
-            // The sizing pass allocates rows at their natural (wide) width
-            // and that painted shape survives into the final paint, which is
-            // what staggered the boxes. During sizing, run the same geometry
-            // with a transparent fill; only the real pass paints.
-            // The monospace font carries ~11 px of invisible top bearing,
-            // so a symmetric margin looks top-heavy: shave the top and give
-            // it to the bottom to equalize the whitespace around the
-            // visible glyphs (box height unchanged).
-            let frame = egui::Frame::new()
-                .fill(if ui.is_sizing_pass() {
-                    egui::Color32::TRANSPARENT
-                } else {
-                    SURFACE
-                })
-                .corner_radius(8)
-                .inner_margin(egui::Margin {
-                    left: 12,
-                    right: 12,
-                    top: 5,
-                    bottom: 13,
-                });
-            frame.show(ui, |ui| {
-                // Top alignment: the title line and its dot share the same
-                // top edge (center alignment pushed the text down so the
-                // dot sat between title and subtitle).
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::TOP),
-                    |ui| add_contents(ui),
-                );
-            });
-        },
-    );
-    egui::Rect::from_min_size(start, egui::vec2(width, child.response.rect.height()))
-}
-
 /// A settings row with a leading status-dot "icon", title, subtitle and a
-/// trailing state label. Disabled rows render dimmed (Android grise l'option).
+/// trailing state label. Disabled rows render dimmed (Android greys the
+/// option). Same gap after every row keeps the stack rhythm uniform.
 fn settings_row(
     ui: &mut egui::Ui,
     icon: egui::Color32,
@@ -511,69 +588,50 @@ fn settings_row(
             egui::Color32::from_rgb(0x4A, 0x4F, 0x4A),
         )
     };
-    settings_row_frame(ui, |ui| {
+    let (_, content, title_center) = settings_row_core(
+        ui,
+        icon,
+        egui::RichText::new(title).color(title_color).strong(),
+        egui::RichText::new(subtitle).small().color(sub_color),
+    );
+    if !state.is_empty() {
         let state_color = if enabled {
             if state == "ON" || state == "✓" { GREEN } else { TEXT_TERTIARY }
         } else {
             egui::Color32::from_rgb(0x4A, 0x4F, 0x4A)
         };
-        // Fixed-zone geometry: Sides expands the row when the natural text
-        // widths exceed the box (its overflow clause), and labels inside a
-        // horizontal layout Extend instead of wrapping. Measure the state,
-        // give the rest to the (wrapping) text block, push the state to the
-        // right edge by consuming the exact remaining gap.
-        let state_font = small_font(ui);
-        let right_w = ui.fonts(|f| {
-            f.layout_no_wrap(state.to_string(), state_font, state_color).size().x
-        });
-        let gap = 10.0;
-        let left_w = (ui.available_width() - right_w - gap).max(60.0);
-        ui.horizontal(|ui| {
-            status_dot(ui, icon);
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(left_w, 0.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(egui::RichText::new(title).color(title_color).strong());
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(subtitle).small().color(sub_color))
-                            .wrap(),
-                    );
-                },
-            );
-            let remaining = ui.available_width();
-            ui.allocate_space(egui::vec2((remaining - right_w).max(0.0), 1.0));
-            ui.label(egui::RichText::new(state).small().color(state_color));
-        });
-    });
-    // Same gap after every row keeps the stack rhythm uniform.
+        settings_row_state(
+            ui,
+            content,
+            title_center,
+            egui::RichText::new(state).small().color(state_color),
+        );
+    }
     ui.add_space(SETTINGS_ROW_GAP);
 }
 
-/// Full-width selectable row for the conversation list (channel + peers):
-/// the hit zone spans the whole panel width, the background reacts to hover,
-/// and an unread counter (when > 0) hugs the right edge like the mobile
-/// badges. The interactive response is created AFTER the content: widgets
-/// added later paint on top in egui's hit-testing, so interacting first
-/// would leave the labels covering the row and `hovered()` would only be
-/// true beside the text. Hover for the background uses raw pointer
-/// geometry, which has no z-ordering.
-fn peer_row(
+/// Full-width selectable row for the conversation list (channel + peers).
+/// The hit zone spans the whole panel width, the background reacts to
+/// hover/selection, and an unread counter (when > 0) hugs the right edge
+/// like the mobile badges. The label is painted by its ink bounds so the
+/// visible text is truly vertically centered — widget layout would park it
+/// at the bottom of its line box and leave dead space above it.
+fn peer_row_text(
     ui: &mut egui::Ui,
     id_salt: &str,
     selected: bool,
     unread: usize,
-    add_contents: impl FnOnce(&mut egui::Ui),
+    dot: Option<egui::Color32>,
+    label: String,
+    label_color: egui::Color32,
+    suffix: Option<&str>,
 ) -> egui::Response {
-    // Same height the old Frame rows had: content line + 2×8 px margins.
-    let content_h = ui
-        .fonts(|f| f.layout_no_wrap("@".to_string(), body_font(ui), TEXT).size().y)
-        .max(16.0);
-    let row_h = content_h + 16.0;
+    const PAD_V: f32 = 8.0;
+    let label_rich = egui::RichText::new(label).color(label_color);
+    let ink = layout_rich(ui, label_rich.clone(), false, f32::INFINITY).mesh_bounds;
     let rect = egui::Rect::from_min_size(
         ui.cursor().min,
-        egui::vec2(ui.available_width(), row_h),
+        egui::vec2(ui.available_width(), PAD_V * 2.0 + ink.height()),
     );
     ui.allocate_space(rect.size());
     let hovered = ui
@@ -585,26 +643,56 @@ fn peer_row(
         egui::CornerRadius::same(8),
         if selected || hovered { ROW_SELECTED } else { BG },
     );
-    ui.allocate_new_ui(
-        egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 8.0))),
-        |ui| {
-            ui.horizontal(|ui| {
-                add_contents(ui);
-                if unread > 0 {
-                    // Right-align the badge by consuming the remaining gap.
-                    let remaining = ui.available_width();
-                    ui.allocate_space(egui::vec2((remaining - 20.0).max(0.0), 1.0));
-                    ui.label(
-                        egui::RichText::new(format!("{unread}"))
-                            .small()
-                            .strong()
-                            .color(BG)
-                            .background_color(GREEN),
-                    );
-                }
-            });
-        },
+    let content = rect.shrink2(egui::vec2(10.0, PAD_V));
+    let center_y = content.top() + ink.height() / 2.0;
+    let text_x = content.left() + if dot.is_some() { 12.0 + 6.0 } else { 0.0 };
+    if let Some(color) = dot {
+        ui.painter()
+            .circle_filled(egui::pos2(content.left() + 4.0, center_y), 4.0, color);
+    }
+    paint_text_top(
+        ui,
+        egui::pos2(text_x, content.top()),
+        label_rich,
+        false,
+        f32::INFINITY,
+        egui::Align::LEFT,
     );
+    if let Some(suffix) = suffix {
+        let suffix_rich = egui::RichText::new(suffix).small().color(TEXT_TERTIARY);
+        let s_h = layout_rich(ui, suffix_rich.clone(), false, f32::INFINITY)
+            .mesh_bounds
+            .height();
+        paint_text_top(
+            ui,
+            egui::pos2(text_x + ink.width() + 8.0, center_y - s_h / 2.0),
+            suffix_rich,
+            false,
+            f32::INFINITY,
+            egui::Align::LEFT,
+        );
+    }
+    if unread > 0 {
+        // Round badge flush with the right padding, vertically on the text.
+        let badge_r = 8.0;
+        let badge_c = egui::pos2(content.right() - badge_r, center_y);
+        ui.painter().circle_filled(badge_c, badge_r, GREEN);
+        let badge_rich = egui::RichText::new(format!("{unread}"))
+            .small()
+            .strong()
+            .color(BG);
+        let b_h = layout_rich(ui, badge_rich.clone(), false, f32::INFINITY)
+            .mesh_bounds
+            .height();
+        paint_text_top(
+            ui,
+            egui::pos2(badge_c.x, badge_c.y - b_h / 2.0),
+            badge_rich,
+            false,
+            f32::INFINITY,
+            egui::Align::Center,
+        );
+    }
     ui.interact(
         rect,
         ui.make_persistent_id(("peer_row", id_salt)),
@@ -1173,20 +1261,18 @@ impl BitchatApp {
     fn show_peer_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         let channel_selected = self.selected == Selection::Broadcast;
-        let channel_click = peer_row(
+        let channel_click = peer_row_text(
             ui,
             "channel",
             channel_selected,
             self.unread.get(CHANNEL_KEY).copied().unwrap_or(0),
-            |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} / common channel",
-                        if channel_selected { ">" } else { " " }
-                    ))
-                    .color(if channel_selected { GREEN } else { TEXT }),
-                );
-            },
+            None,
+            format!(
+                "{} / common channel",
+                if channel_selected { ">" } else { " " }
+            ),
+            if channel_selected { GREEN } else { TEXT },
+            None,
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
         if channel_click.clicked() {
@@ -1213,25 +1299,15 @@ impl BitchatApp {
                         TEXT_TERTIARY
                     };
                     let unread = self.unread.get(&peer.peer_id).copied().unwrap_or(0);
-                    let response = peer_row(
+                    let response = peer_row_text(
                         ui,
                         &peer.peer_id,
                         selected,
                         unread,
-                        |ui| {
-                            status_dot(ui, dot);
-                            ui.label(
-                                egui::RichText::new(format!("@{}", peer.nickname))
-                                    .color(if selected { GREEN } else { TEXT }),
-                            );
-                            if peer.has_session {
-                                ui.label(
-                                    egui::RichText::new("[tls]")
-                                        .small()
-                                        .color(TEXT_TERTIARY),
-                                );
-                            }
-                        },
+                        Some(dot),
+                        format!("@{}", peer.nickname),
+                        if selected { GREEN } else { TEXT },
+                        if peer.has_session { Some("[tls]") } else { None },
                     );
                     if response
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1714,76 +1790,92 @@ impl BitchatApp {
                             "Type a message and press Enter to send",
                             "Broadcasts reach the whole mesh; private messages use a Noise session",
                         ] {
-                            ui.horizontal(|ui| {
-                                status_dot_sized(ui, TEXT_TERTIARY, small_font(ui).size);
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new(hint).small().color(TEXT));
-                            });
-                            ui.add_space(4.0);
+                            // Painted by ink bounds (see paint_text_top): the
+                            // bullet dot sits on the text line with no dead
+                            // space above or below.
+                            let hint_rich = egui::RichText::new(hint).small().color(TEXT);
+                            let ink = layout_rich(ui, hint_rich.clone(), false, f32::INFINITY)
+                                .mesh_bounds;
+                            let line = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(ui.available_width(), ink.height()),
+                            );
+                            ui.allocate_space(line.size());
+                            ui.painter().circle_filled(
+                                egui::pos2(line.left() + 4.0, line.top() + ink.height() / 2.0),
+                                4.0,
+                                TEXT_TERTIARY,
+                            );
+                            paint_text_top(
+                                ui,
+                                egui::pos2(line.left() + 12.0 + 6.0, line.top()),
+                                hint_rich,
+                                false,
+                                f32::INFINITY,
+                                egui::Align::LEFT,
+                            );
+                            ui.add_space(6.0);
                         }
                     }
                     SettingsTab::Settings => {
                         section_label(ui, "Settings");
                         // Chat layout toggle, persisted in bitchatd.toml — the
                         // same Bubbles/Matrix choice the mobile app offers.
-                        settings_row_frame(ui, |ui| {
-                            // Same fixed-zone geometry as settings_row: the
-                            // segmented toggle occupies a measured right
-                            // zone, the text block the rest (see settings_row).
-                            let font = body_font(ui);
-                            let pad = ui.spacing().button_padding.x;
-                            let seg = ui.fonts(|f| {
-                                ["Bubbles", "Matrix"].iter().map(|t| f.layout_no_wrap(t.to_string(), font.clone(), TEXT).size().x).sum::<f32>()
-                                    + 4.0 * pad
-                                    + ui.spacing().item_spacing.x
-                            });
-                            let gap = 10.0;
-                            let left_w = (ui.available_width() - seg - gap).max(60.0);
-                            ui.horizontal(|ui| {
-                                status_dot(ui, GREEN);
-                                ui.add_space(6.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
+                        let font = body_font(ui);
+                        let pad = ui.spacing().button_padding.x;
+                        let toggle_w = ui.fonts(|f| {
+                            ["Bubbles", "Matrix"].iter().map(|t| f.layout_no_wrap(t.to_string(), font.clone(), TEXT).size().x).sum::<f32>()
+                                + 4.0 * pad
+                                + ui.spacing().item_spacing.x
+                        });
+                        let (_, content, title_center) = settings_row_core(
+                            ui,
+                            GREEN,
+                            egui::RichText::new("Chat Layout").color(TEXT).strong(),
+                            egui::RichText::new(
+                                "Messenger bubbles, or the flat terminal transcript.",
+                            )
+                            .small()
+                            .color(TEXT_TERTIARY),
+                        );
+                        // Segmented toggle in a fixed rect flush with the
+                        // row's right padding, centered on the title line (a
+                        // trailing layout leaves an extra item-spacing gap
+                        // inside the margin).
+                        let toggle_h = 24.0;
+                        let toggle_rect = egui::Rect::from_min_max(
+                            egui::pos2(content.right() - toggle_w, title_center - toggle_h / 2.0),
+                            egui::pos2(content.right(), title_center + toggle_h / 2.0),
+                        );
+                        ui.allocate_new_ui(
+                            egui::UiBuilder::new().max_rect(toggle_rect),
+                            |ui| {
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Chat Layout").color(TEXT).strong(),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(
-                                                    "Messenger bubbles, or the flat terminal transcript.",
-                                                )
-                                                .small()
-                                                .color(TEXT_TERTIARY),
-                                            )
-                                            .wrap(),
-                                        );
+                                        let mut theme = self.theme;
+                                        for (label, value) in [
+                                            ("Bubbles", ChatTheme::Bubbles),
+                                            ("Matrix", ChatTheme::Matrix),
+                                        ] {
+                                            if ui
+                                                .selectable_label(theme == value, label)
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .clicked()
+                                                && theme != value
+                                            {
+                                                theme = value;
+                                            }
+                                        }
+                                        if theme != self.theme {
+                                            self.theme = theme;
+                                            self.save_theme(&identity_path);
+                                        }
                                     },
                                 );
-                                let remaining = ui.available_width();
-                                ui.allocate_space(egui::vec2((remaining - seg).max(0.0), 1.0));
-                                let mut theme = self.theme;
-                                for (label, value) in [
-                                    ("Bubbles", ChatTheme::Bubbles),
-                                    ("Matrix", ChatTheme::Matrix),
-                                ] {
-                                    if ui
-                                        .selectable_label(theme == value, label)
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .clicked()
-                                        && theme != value
-                                    {
-                                        theme = value;
-                                    }
-                                }
-                                if theme != self.theme {
-                                    self.theme = theme;
-                                    self.save_theme(&identity_path);
-                                }
-                            });
-                        });
-                        ui.add_space(8.0);
+                            },
+                        );
+                        ui.add_space(SETTINGS_ROW_GAP);
                         // Downloads housekeeping: wipe bitchatd_downloads
                         // (.gitkeep is never touched) behind a two-step
                         // confirm, same fixed-zone row geometry as above.
@@ -1795,45 +1887,23 @@ impl BitchatApp {
                             "clean ▸"
                         };
                         let state_color = if armed { AMBER } else { GREEN };
-                        let state_font = small_font(ui);
-                        let right_w = ui.fonts(|f| {
-                            f.layout_no_wrap(state.to_string(), state_font, state_color)
-                                .size()
-                                .x
-                        });
-                        let gap = 10.0;
-                        let dl_row = settings_row_frame(ui, |ui| {
-                            let left_w = (ui.available_width() - right_w - gap).max(60.0);
-                            ui.horizontal(|ui| {
-                                status_dot(ui, GREEN);
-                                ui.add_space(6.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Downloads")
-                                                .color(TEXT)
-                                                .strong(),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!(
-                                                    "{count} file(s) in bitchatd_downloads — \
-                                                     wipes everything but .gitkeep"
-                                                ))
-                                                .small()
-                                                .color(TEXT_TERTIARY),
-                                            )
-                                            .wrap(),
-                                        );
-                                    },
-                                );
-                                let remaining = ui.available_width();
-                                ui.allocate_space(egui::vec2((remaining - right_w).max(0.0), 1.0));
-                                ui.label(egui::RichText::new(state).small().color(state_color));
-                            });
-                        });
+                        let (dl_row, content, title_center) = settings_row_core(
+                            ui,
+                            GREEN,
+                            egui::RichText::new("Downloads").color(TEXT).strong(),
+                            egui::RichText::new(format!(
+                                "{count} file(s) in bitchatd_downloads — \
+                                 wipes everything but .gitkeep"
+                            ))
+                            .small()
+                            .color(TEXT_TERTIARY),
+                        );
+                        settings_row_state(
+                            ui,
+                            content,
+                            title_center,
+                            egui::RichText::new(state).small().color(state_color),
+                        );
                         let dl_click = ui
                             .interact(dl_row, egui::Id::new("clear_downloads_row"), egui::Sense::click())
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1888,45 +1958,25 @@ impl BitchatApp {
                         );
                         ui.add_space(8.0);
                         ui.separator();
-                        // Same fixed-zone geometry as settings_row (see
-                        // settings_row); the whole row is the click target.
+                        // Same fixed-zone geometry as the rows above; the
+                        // whole row is the click target.
                         let state = "open ▸";
-                        let state_font = small_font(ui);
-                        let right_w = ui.fonts(|f| {
-                            f.layout_no_wrap(state.to_string(), state_font, GREEN).size().x
-                        });
-                        let gap = 10.0;
-                        let debug_row = settings_row_frame(ui, |ui| {
-                            let left_w = (ui.available_width() - right_w - gap).max(60.0);
-                            ui.horizontal(|ui| {
-                                status_dot(ui, GREEN);
-                                ui.add_space(6.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new("Debug Settings")
-                                                .color(TEXT)
-                                                .strong(),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(
-                                                    "Diagnostics, transports, sync parameters and console",
-                                                )
-                                                .small()
-                                                .color(TEXT_TERTIARY),
-                                            )
-                                            .wrap(),
-                                        );
-                                    },
-                                );
-                                let remaining = ui.available_width();
-                                ui.allocate_space(egui::vec2((remaining - right_w).max(0.0), 1.0));
-                                ui.label(egui::RichText::new(state).small().color(GREEN));
-                            });
-                        });
+                        let (debug_row, content, title_center) = settings_row_core(
+                            ui,
+                            GREEN,
+                            egui::RichText::new("Debug Settings").color(TEXT).strong(),
+                            egui::RichText::new(
+                                "Diagnostics, transports, sync parameters and console",
+                            )
+                            .small()
+                            .color(TEXT_TERTIARY),
+                        );
+                        settings_row_state(
+                            ui,
+                            content,
+                            title_center,
+                            egui::RichText::new(state).small().color(GREEN),
+                        );
                         let debug_click = ui
                             .interact(
                                 debug_row,
