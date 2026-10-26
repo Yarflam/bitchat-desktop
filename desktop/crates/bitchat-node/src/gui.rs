@@ -180,11 +180,13 @@ fn mime_of(path: &std::path::Path) -> String {
     }
 }
 
-/// Small status dot.
+/// Small status dot, vertically aligned with the title text line it heads
+/// (monospace glyphs sit high in their line box, so the dot hugs the top
+/// of its 16 px allocation instead of centering on the whole text block).
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
     ui.painter()
-        .circle_filled(egui::pos2(rect.center().x, rect.center().y), 4.0, color);
+        .circle_filled(egui::pos2(rect.center().x, rect.top() + 6.0), 4.0, color);
 }
 
 /// Green block logo, like the app's pixel robot glyph.
@@ -454,7 +456,13 @@ fn settings_row_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
                 .corner_radius(8)
                 .inner_margin(egui::Margin::symmetric(12, 9));
             frame.show(ui, |ui| {
-                ui.horizontal(add_contents);
+                // Top alignment: the title line and its dot share the same
+                // top edge (center alignment pushed the text down so the
+                // dot sat between title and subtitle).
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::TOP),
+                    |ui| add_contents(ui),
+                );
             });
         },
     );
@@ -520,19 +528,34 @@ fn settings_row(
 }
 
 /// Full-width selectable row for the conversation list (channel + peers):
-/// the hit zone spans the whole panel width, the background is chosen
-/// before the content is painted so hover highlights properly, and an
-/// unread counter (when > 0) hugs the right edge like the mobile badges.
+/// the hit zone spans the whole panel width, the background reacts to hover,
+/// and an unread counter (when > 0) hugs the right edge like the mobile
+/// badges. The interactive response is created AFTER the content: widgets
+/// added later paint on top in egui's hit-testing, so interacting first
+/// would leave the labels covering the row and `hovered()` would only be
+/// true beside the text. Hover for the background uses raw pointer
+/// geometry, which has no z-ordering.
 fn peer_row(
     ui: &mut egui::Ui,
+    id_salt: &str,
     selected: bool,
     unread: usize,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
-    let row_h = ui.fonts(|f| f.row_height(&body_font(ui))) + 16.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
-    let hovered = response.hovered() || response.is_pointer_button_down_on();
+    // Same height the old Frame rows had: content line + 2×8 px margins.
+    let content_h = ui
+        .fonts(|f| f.layout_no_wrap("@".to_string(), body_font(ui), TEXT).size().y)
+        .max(16.0);
+    let row_h = content_h + 16.0;
+    let rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), row_h),
+    );
+    ui.allocate_space(rect.size());
+    let hovered = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| rect.contains(pos));
     ui.painter().rect_filled(
         rect,
         egui::CornerRadius::same(8),
@@ -558,7 +581,11 @@ fn peer_row(
             });
         },
     );
-    response
+    ui.interact(
+        rect,
+        ui.make_persistent_id(("peer_row", id_salt)),
+        egui::Sense::click(),
+    )
 }
 
 impl BitchatApp {
@@ -1126,6 +1153,7 @@ impl BitchatApp {
         let channel_selected = self.selected == Selection::Broadcast;
         let channel_click = peer_row(
             ui,
+            "channel",
             channel_selected,
             self.unread.get(CHANNEL_KEY).copied().unwrap_or(0),
             |ui| {
@@ -1165,6 +1193,7 @@ impl BitchatApp {
                     let unread = self.unread.get(&peer.peer_id).copied().unwrap_or(0);
                     let response = peer_row(
                         ui,
+                        &peer.peer_id,
                         selected,
                         unread,
                         |ui| {
@@ -2376,7 +2405,11 @@ impl eframe::App for BitchatApp {
                             close = true;
                         }
                     });
+                // Foreground order: the backdrop Area below is also
+                // Foreground, and within an order later painters win — the
+                // window must come after or the veil covers the image.
                 egui::Window::new("image_preview")
+                    .order(egui::Order::Foreground)
                     .title_bar(false)
                     .collapsible(false)
                     .resizable(false)
@@ -2424,6 +2457,7 @@ impl eframe::App for BitchatApp {
                     }
                 });
             egui::Window::new("bitchatd · envoi impossible")
+                .order(egui::Order::Foreground)
                 .collapsible(false)
                 .resizable(false)
                 .movable(false)
