@@ -47,6 +47,34 @@ const INPUT_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0B);
 const INPUT_BORDER: egui::Color32 = egui::Color32::from_rgb(0x33, 0x36, 0x35);
 const ROW_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x10, 0x1D, 0x12);
 const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x10, 0x0D);
+/// Dark-button hover shade (attach button lives on INPUT_SURFACE).
+const HOVER_DARK: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x24, 0x1F);
+/// Hard cap for every settings/debug row, so the auto-sized settings
+/// window keeps a constant width instead of stretching.
+const SETTINGS_ROW_MAX_WIDTH: f32 = 560.0;
+
+/// Button with working hover feedback for an explicit base colour.
+/// `Button::fill` overrides egui's hovered visuals (the fill wins over
+/// `weak_bg_fill` in `Button::paint`), so a filled button never changes
+/// colour on hover. Routing the two fills through a scoped style override
+/// restores the hovered state while keeping the custom palette.
+fn themed_button(
+    ui: &mut egui::Ui,
+    button: egui::Button,
+    base: egui::Color32,
+    hover: egui::Color32,
+) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = base;
+        widgets.inactive.bg_fill = base;
+        widgets.hovered.weak_bg_fill = hover;
+        widgets.hovered.bg_fill = hover;
+        widgets.hovered.bg_stroke = egui::Stroke::new(1.0, hover);
+        ui.add(button)
+    })
+    .inner
+}
 
 pub fn terminal_style(ctx: &egui::Context) {
     use eframe::egui::{FontFamily, FontId, TextStyle};
@@ -374,6 +402,10 @@ pub struct BitchatApp {
     theme: ChatTheme,
     /// Decoded images for inline display, keyed by chat line id.
     image_cache: HashMap<String, LoadedImage>,
+    /// Chat line id whose image is shown in the full-screen preview overlay.
+    preview_line: Option<String>,
+    /// Two-step confirm arm for the "clean downloads" action.
+    confirm_clear_downloads: bool,
 }
 
 const MAX_LOG_LINES: usize = 60;
@@ -385,20 +417,16 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
-/// Shared full-width settings-row container (identical geometry for every
+/// Shared fixed-width settings-row container (identical geometry for every
 /// row, including the interactive Chat Layout toggle).
-/// Row boxes keep a constant width no matter what the window does: egui
-/// windows keep auto-sizing around their content even with
-/// `resizable(false)`, and a wide row grows the window mid-frame, which
-/// staggered the boxes of the rows laid out before it. A fixed width makes
-/// every row identical by construction.
+/// Rows are capped at SETTINGS_ROW_MAX_WIDTH instead of tracking
+/// `available_width()`: egui windows auto-size around their content even
+/// with `resizable(false)`, and feeding the window width back into the row
+/// width made the very first frame stretch the window to the full screen.
+/// A bounded row width keeps the window a constant size by construction.
 /// Returns the painted box so rows can use it as a click target.
-///
-/// Rows fill whatever width the window currently has. They can no longer
-/// overflow it (fixed-zone geometry with wrapping subtitles), so the window
-/// no longer grows mid-frame and the boxes cannot stagger.
 fn settings_row_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
-    let width = ui.available_width().max(120.0);
+    let width = ui.available_width().min(SETTINGS_ROW_MAX_WIDTH).max(120.0);
     let start = ui.cursor().min;
     let child = ui.allocate_ui_with_layout(
         egui::vec2(width, 0.0),
@@ -762,6 +790,37 @@ impl BitchatApp {
         std::fs::write(&path, bytes).ok().map(|()| path)
     }
 
+    /// Number of files in the downloads directory (`.gitkeep` excluded).
+    fn count_downloads(&self) -> usize {
+        std::fs::read_dir(self.downloads_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_name() != ".gitkeep")
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Delete every downloaded file, keeping `.gitkeep` so the folder
+    /// itself stays tracked by git. Returns how many files were removed.
+    fn clear_downloads(&self) -> usize {
+        let mut removed = 0;
+        if let Ok(entries) = std::fs::read_dir(self.downloads_dir()) {
+            for entry in entries.flatten() {
+                if entry.file_name() == ".gitkeep" {
+                    continue;
+                }
+                if entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// Open a file with its default Windows application.
     fn open_path(path: &std::path::Path) {
         let _ = std::process::Command::new("cmd")
@@ -969,16 +1028,17 @@ impl BitchatApp {
             }
         } else {
             block_logo(ui);
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("/ @{}", self.nickname))
-                            .heading()
-                            .color(GREEN),
-                    )
-                    .fill(BG)
-                    .corner_radius(6),
+            if themed_button(
+                ui,
+                egui::Button::new(
+                    egui::RichText::new(format!("/ @{}", self.nickname))
+                        .heading()
+                        .color(GREEN),
                 )
+                .corner_radius(6),
+                BG,
+                ROW_SELECTED,
+            )
                 .on_hover_text("changer le pseudo")
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
@@ -1095,7 +1155,10 @@ impl BitchatApp {
             });
     }
 
-    fn show_messages(&self, ui: &mut egui::Ui, key: &str) {
+    /// Renders the conversation; returns the id of the clicked image line
+    /// (preview request), if any.
+    fn show_messages(&self, ui: &mut egui::Ui, key: &str) -> Option<String> {
+        let mut preview_request = None;
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
@@ -1114,13 +1177,17 @@ impl BitchatApp {
                     });
                 }
                 for line in lines {
-                    match self.theme {
+                    let request = match self.theme {
                         ChatTheme::Bubbles => self.show_bubble_line(ui, line),
                         ChatTheme::Matrix => self.show_matrix_line(ui, line),
+                    };
+                    if request.is_some() {
+                        preview_request = request;
                     }
                     ui.add_space(2.0);
                 }
             });
+        preview_request
     }
 
     /// Message body width for the meta-time placement calculation.
@@ -1177,7 +1244,8 @@ impl BitchatApp {
     /// breathing margin), with a greyed dynamic timestamp riding the last
     /// text line bottom-aligned when there is room, right-aligned on its own
     /// line otherwise.
-    fn show_bubble_line(&self, ui: &mut egui::Ui, line: &ChatLine) {
+    fn show_bubble_line(&self, ui: &mut egui::Ui, line: &ChatLine) -> Option<String> {
+        let mut preview_request = None;
         let author_color = if line.mine {
             AMBER
         } else {
@@ -1255,7 +1323,9 @@ impl BitchatApp {
                             egui::vec2(band_w, body.height.max(14.0)),
                             egui::Layout::left_to_right(egui::Align::BOTTOM),
                             |ui| {
-                                self.show_content(ui, line);
+                                if let Some(id) = self.show_content(ui, line) {
+                                    preview_request = Some(id);
+                                }
                                 ui.add_space(TIME_GAP);
                                 ui.label(
                                     egui::RichText::new(&time).small().color(time_color),
@@ -1263,7 +1333,9 @@ impl BitchatApp {
                             },
                         );
                     } else {
-                        self.show_content(ui, line);
+                        if let Some(id) = self.show_content(ui, line) {
+                            preview_request = Some(id);
+                        }
                         // Fixed-size row: right-aligned timestamp without the
                         // vertical stretch of `with_layout`.
                         ui.allocate_ui_with_layout(
@@ -1279,6 +1351,7 @@ impl BitchatApp {
                     }
                 });
         });
+        preview_request
     }
 
     /// Matrix layout, mirroring the mobile terminal-style transcript:
@@ -1286,7 +1359,8 @@ impl BitchatApp {
     /// timestamp greyed and smaller immediately right of the text block,
     /// bottom-aligned. The row is allocated at its measured size: a plain
     /// `with_layout` band would stretch across the viewport.
-    fn show_matrix_line(&self, ui: &mut egui::Ui, line: &ChatLine) {
+    fn show_matrix_line(&self, ui: &mut egui::Ui, line: &ChatLine) -> Option<String> {
+        let mut preview_request = None;
         let author_color = if line.mine {
             AMBER
         } else {
@@ -1315,16 +1389,21 @@ impl BitchatApp {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(nick_text).strong().color(author_color));
                     ui.add_space(1.0);
-                    self.show_content(ui, line);
+                    if let Some(id) = self.show_content(ui, line) {
+                        preview_request = Some(id);
+                    }
                 });
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new(time).small().color(TEXT_TERTIARY));
             },
         );
+        preview_request
     }
 
     /// Render a message body: plain text, inline image, or file chip.
-    fn show_content(&self, ui: &mut egui::Ui, line: &ChatLine) {
+    /// Returns the line id when the inline image was clicked (the caller
+    /// turns that into the full-screen preview request).
+    fn show_content(&self, ui: &mut egui::Ui, line: &ChatLine) -> Option<String> {
         match &line.content {
             ChatContent::Text(text) => {
                 // Force wrapping: in a horizontal row (timestamp riding the
@@ -1333,6 +1412,7 @@ impl BitchatApp {
                 ui.add(
                     egui::Label::new(egui::RichText::new(text).color(TEXT)).wrap(),
                 );
+                None
             }
             ChatContent::File {
                 name,
@@ -1356,13 +1436,18 @@ impl BitchatApp {
                         egui::load::SizedTexture::new(image.texture.id(), display);
                     let response = ui
                         .add(egui::Image::new(sized).corner_radius(egui::CornerRadius::same(8)))
-                        .on_hover_text(format!("{name} — cliquer pour ouvrir"))
+                        .on_hover_text(format!("{name} — cliquer : aperçu · double-cliquer : ouvrir"))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if response.clicked() {
+                    if response.double_clicked() {
+                        // Keep the external viewer on double-click.
                         if let Some(path) = open_target {
                             Self::open_path(&path);
                         }
+                    } else if response.clicked() {
+                        // Single click: in-app preview overlay.
+                        return Some(line.id.clone());
                     }
+                    None
                 } else {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("📎").size(16.0));
@@ -1383,7 +1468,9 @@ impl BitchatApp {
                                 Self::open_path(&path);
                             }
                         }
-                    });
+                        None
+                    })
+                    .inner
                 }
             }
         }
@@ -1525,6 +1612,75 @@ impl BitchatApp {
                             });
                         });
                         ui.add_space(8.0);
+                        // Downloads housekeeping: wipe bitchatd_downloads
+                        // (.gitkeep is never touched) behind a two-step
+                        // confirm, same fixed-zone row geometry as above.
+                        let count = self.count_downloads();
+                        let armed = self.confirm_clear_downloads;
+                        let state = if armed {
+                            "tout supprimer ?"
+                        } else {
+                            "nettoyer ▸"
+                        };
+                        let state_color = if armed { AMBER } else { GREEN };
+                        let state_font = small_font(ui);
+                        let right_w = ui.fonts(|f| {
+                            f.layout_no_wrap(state.to_string(), state_font, state_color)
+                                .size()
+                                .x
+                        });
+                        let gap = 10.0;
+                        let dl_row = settings_row_frame(ui, |ui| {
+                            let left_w = (ui.available_width() - right_w - gap).max(60.0);
+                            ui.horizontal(|ui| {
+                                status_dot(ui, GREEN);
+                                ui.add_space(6.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(left_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Téléchargements")
+                                                .color(TEXT)
+                                                .strong(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "{count} fichier(s) dans bitchatd_downloads — \
+                                                     tout effacer sauf .gitkeep"
+                                                ))
+                                                .small()
+                                                .color(TEXT_TERTIARY),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                let remaining = ui.available_width();
+                                ui.allocate_space(egui::vec2((remaining - right_w).max(0.0), 1.0));
+                                ui.label(egui::RichText::new(state).small().color(state_color));
+                            });
+                        });
+                        let dl_click = ui
+                            .interact(dl_row, egui::Id::new("clear_downloads_row"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if dl_click.clicked() {
+                            if armed {
+                                let removed = self.clear_downloads();
+                                self.log(format!(
+                                    "{removed} fichier(s) supprimé(s) de bitchatd_downloads"
+                                ));
+                                self.confirm_clear_downloads = false;
+                            } else {
+                                self.confirm_clear_downloads = true;
+                            }
+                        }
+                        dl_click.on_hover_text(if armed {
+                            "cliquer à nouveau pour tout supprimer"
+                        } else {
+                            "nettoyer le dossier de téléchargements"
+                        });
                         settings_row(
                             ui,
                             BLUE,
@@ -1801,20 +1957,22 @@ impl BitchatApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Connect")
-                                                            .small()
-                                                            .color(BG),
-                                                    )
-                                                    .fill(if known {
-                                                        TEXT_TERTIARY
-                                                    } else {
-                                                        GREEN
-                                                    })
-                                                    .corner_radius(6),
+                                            let connect_base = if known {
+                                                TEXT_TERTIARY
+                                            } else {
+                                                GREEN
+                                            };
+                                            if themed_button(
+                                                ui,
+                                                egui::Button::new(
+                                                    egui::RichText::new("Connect")
+                                                        .small()
+                                                        .color(BG),
                                                 )
+                                                .corner_radius(6),
+                                                connect_base,
+                                                connect_base.gamma_multiply(1.35),
+                                            )
                                                 .on_hover_text(if known {
                                                     "already connected"
                                                 } else {
@@ -1926,14 +2084,15 @@ impl eframe::App for BitchatApp {
             ui.horizontal(|ui| {
                 self.show_nickname_editor(ui, &identity_path);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("⚙").heading().color(TEXT),
-                            )
-                            .fill(BG)
-                            .corner_radius(6),
+                    if themed_button(
+                        ui,
+                        egui::Button::new(
+                            egui::RichText::new("⚙").heading().color(TEXT),
                         )
+                        .corner_radius(6),
+                        BG,
+                        ROW_SELECTED,
+                    )
                         .on_hover_text("settings & about")
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
@@ -1972,13 +2131,14 @@ impl eframe::App for BitchatApp {
         egui::TopBottomPanel::bottom("composer").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("📎").size(17.0))
-                            .fill(INPUT_SURFACE)
-                            .corner_radius(20)
-                            .min_size(egui::vec2(42.0, 42.0)),
-                    )
+                if themed_button(
+                    ui,
+                    egui::Button::new(egui::RichText::new("📎").size(17.0))
+                        .corner_radius(20)
+                        .min_size(egui::vec2(42.0, 42.0)),
+                    INPUT_SURFACE,
+                    HOVER_DARK,
+                )
                     .on_hover_text("envoyer une image, une vidéo ou un document (≤ 96 Ko sur le mesh v1)")
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
@@ -2008,13 +2168,14 @@ impl eframe::App for BitchatApp {
                 }
                 let enter = response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let send = ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("➤").size(17.0))
-                            .fill(GREEN)
-                            .corner_radius(20)
-                            .min_size(egui::vec2(46.0, 42.0)),
-                    )
+                let send = themed_button(
+                    ui,
+                    egui::Button::new(egui::RichText::new("➤").size(17.0))
+                        .corner_radius(20)
+                        .min_size(egui::vec2(46.0, 42.0)),
+                    GREEN,
+                    GREEN.gamma_multiply(1.35),
+                )
                     .on_hover_text("envoyer (Entree)")
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked();
@@ -2059,7 +2220,9 @@ impl eframe::App for BitchatApp {
             });
             ui.separator();
             ui.add_space(2.0);
-            self.show_messages(ui, &key);
+            if let Some(preview_id) = self.show_messages(ui, &key) {
+                self.preview_line = Some(preview_id);
+            }
         });
 
         if self.show_settings {
@@ -2067,6 +2230,59 @@ impl eframe::App for BitchatApp {
         }
         if self.show_debug {
             self.show_debug_window(ctx);
+        }
+
+        // Full-screen image preview: dark backdrop (click beside the image
+        // closes), centered window with the texture, Échap also closes.
+        if let Some(id) = self.preview_line.clone() {
+            if let Some(image) = self.image_cache.get(&id) {
+                let screen = ctx.screen_rect();
+                let [w, h] = image.size;
+                let scale = (screen.width() * 0.9 / w as f32)
+                    .min(screen.height() * 0.82 / h as f32);
+                let display = egui::vec2(w as f32 * scale, h as f32 * scale);
+                let mut close = false;
+                egui::Area::new(egui::Id::new("preview_backdrop"))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        let (rect, response) =
+                            ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                        ui.painter()
+                            .rect_filled(rect, 0, egui::Color32::from_black_alpha(210));
+                        if response.clicked() {
+                            close = true;
+                        }
+                    });
+                egui::Window::new("image_preview")
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .movable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::new(egui::load::SizedTexture::new(
+                                    image.texture.id(),
+                                    display,
+                                ))
+                                .corner_radius(egui::CornerRadius::same(8)),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("clic à côté ou Échap pour fermer")
+                                    .small()
+                                    .color(TEXT_TERTIARY),
+                            );
+                        });
+                    });
+                if close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    self.preview_line = None;
+                }
+            } else {
+                self.preview_line = None;
+            }
         }
 
         // No global cursor override: egui already shows the hand over real
@@ -2133,6 +2349,8 @@ impl BitchatApp {
             notifications_enabled: std::env::var_os("BITCHATD_NOTIFY").is_some(),
             theme: Self::load_theme(identity_path),
             image_cache: HashMap::new(),
+            preview_line: None,
+            confirm_clear_downloads: false,
         }
     }
 }
