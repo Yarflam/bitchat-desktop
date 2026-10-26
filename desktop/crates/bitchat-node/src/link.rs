@@ -10,11 +10,15 @@ use bitchat_ble::central::{CentralCommand, CentralEventOut, CentralHandle};
 use bitchat_ble::peripheral::{PeripheralCommand, PeripheralEvent, PeripheralHandle};
 use bitchat_ble::PeripheralId;
 use bitchat_wire::announce::{IdentityAnnouncement, PeerCapabilities};
+use bitchat_wire::file_packet::FilePacket;
 use bitchat_wire::gcs;
 use bitchat_wire::identity::verify_packet;
 use bitchat_wire::noise::{derive_peer_id, NoiseSession};
 use bitchat_wire::noise_payload::{
     AuthenticatedPeerState, NoisePayload, NoisePayloadType, PrivateMessagePacket,
+};
+use bitchat_wire::reassembly::{
+    create_fragments, Reassembler, Reassembly, FRAGMENT_SIZE_THRESHOLD, MAX_FRAGMENTS_PER_ID,
 };
 use bitchat_wire::sync::RequestSyncPacket;
 use bitchat_wire::{MessageType, Packet};
@@ -53,6 +57,15 @@ const SYNC_PERIOD: Duration = Duration::from_secs(30);
 /// Drop a session after this many consecutive decrypt failures, like the
 /// Android client does before re-handshaking.
 const MAX_DECRYPT_FAILURES: u32 = 3;
+
+/// Maximum encoded file-TLV size placed on the wire. Fragmentation caps a
+/// reassembled packet at `MAX_FRAGMENTS_PER_ID × fragment size` (~118 KB at
+/// best, less with routes); 100 KB leaves margin for the TLV and packet
+/// headers on every hop, matching what phone peers can actually reassemble.
+pub const MAX_WIRE_FILE_BYTES: usize = 100_000;
+
+/// Maximum file CONTENT the GUI should offer to send (TLV adds ~30 bytes).
+pub const MAX_FILE_CONTENT_BYTES: u64 = 99_000;
 
 fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -110,6 +123,16 @@ pub enum LinkEvent {
         capabilities: u64,
         signing_public_key: String,
     },
+    /// Decrypted private file transfer (`FILE_TRANSFER` Noise payload 0x20).
+    PrivateFile {
+        peer_id: String,
+        file: FilePacket,
+    },
+    /// Public file transfer (signed `FILE_TRANSFER` packet 0x22).
+    BroadcastFile {
+        peer_id: String,
+        file: FilePacket,
+    },
     /// A peer advertisement was seen during scanning.
     PeerDiscovered {
         address: String,
@@ -133,6 +156,10 @@ pub enum LinkCommand {
     SendPrivateMessage { peer_id: String, content: String },
     /// Mesh-wide broadcast message.
     SendBroadcastMessage { content: String },
+    /// Private file transfer (Noise-encrypted `FILE_TRANSFER` payload 0x20).
+    SendPrivateFile { peer_id: String, file: FilePacket },
+    /// Public file transfer (signed `FILE_TRANSFER` packet 0x22).
+    SendBroadcastFile { file: FilePacket },
     /// Change our nickname and re-announce to every route immediately.
     SetNickname { nickname: String },
     /// Send a gossip sync request; `None` broadcasts to all neighbors.
@@ -187,6 +214,8 @@ impl MeshLink {
             peers: HashMap::new(),
             verified: HashMap::new(),
             pending: HashMap::new(),
+            pending_files: HashMap::new(),
+            reassembler: Reassembler::new(),
             decrypt_failures: HashMap::new(),
             peerstate_sent: HashSet::new(),
             connecting: HashSet::new(),
@@ -219,6 +248,25 @@ impl MeshLink {
                 peer_id: peer_id.to_string(),
                 content: content.to_string(),
             })
+            .await
+            .map_err(|_| LinkError::Closed)
+    }
+
+    /// Send a file privately to a peer (Noise `FILE_TRANSFER` payload 0x20).
+    pub async fn send_private_file(&self, peer_id: &str, file: FilePacket) -> Result<(), LinkError> {
+        self.commands
+            .send(LinkCommand::SendPrivateFile {
+                peer_id: peer_id.to_string(),
+                file,
+            })
+            .await
+            .map_err(|_| LinkError::Closed)
+    }
+
+    /// Send a file on the common channel (signed `FILE_TRANSFER` packet 0x22).
+    pub async fn send_broadcast_file(&self, file: FilePacket) -> Result<(), LinkError> {
+        self.commands
+            .send(LinkCommand::SendBroadcastFile { file })
             .await
             .map_err(|_| LinkError::Closed)
     }
@@ -280,6 +328,10 @@ struct Actor {
     verified: HashMap<String, bool>,
     /// Messages queued while a handshake is in flight.
     pending: HashMap<String, Vec<(String, String)>>,
+    /// Files queued while the Noise handshake with a peer completes.
+    pending_files: HashMap<String, Vec<(String, FilePacket)>>,
+    /// Incoming FRAGMENT reassembly (Android/iOS-compatible caps).
+    reassembler: Reassembler,
     decrypt_failures: HashMap<String, u32>,
     /// Peers that already received our AuthenticatedPeerState for the current
     /// Noise session generation; re-handshake clears the entry so we resend.
@@ -321,6 +373,12 @@ impl Actor {
                     }
                     Some(LinkCommand::SendBroadcastMessage { content }) => {
                         self.send_broadcast_message(&content).await;
+                    }
+                    Some(LinkCommand::SendPrivateFile { peer_id, file }) => {
+                        self.send_private_file(&peer_id, file).await;
+                    }
+                    Some(LinkCommand::SendBroadcastFile { file }) => {
+                        self.send_broadcast_file(file).await;
                     }
                     Some(LinkCommand::ConnectAddress { address }) => {
                         self.info(format!(
@@ -520,6 +578,8 @@ impl Actor {
             MessageType::RequestSync => self.handle_request_sync(sender, &packet),
             MessageType::NoiseHandshake => self.handle_noise_handshake(sender, packet, via).await,
             MessageType::NoiseEncrypted => self.handle_noise_encrypted(sender, packet).await,
+            MessageType::Fragment => self.handle_fragment(sender, packet, via).await,
+            MessageType::FileTransfer => self.handle_file_transfer(sender, packet, via).await,
             other => self.info(format!(
                 "ignoring {other:?} from {sender} (not implemented yet)"
             )),
@@ -706,14 +766,129 @@ impl Actor {
         packet.recipient_id = Some(BROADCAST_RECIPIENT);
         packet.signature = self.identity.signing.sign_packet(&packet);
 
-        // Track our own broadcast for gossip sync, then flood our routes.
+        // Track our own broadcast for gossip sync (small payloads only),
+        // then flood our routes.
         let id = Self::packet_sync_id(&packet);
         self.mark_seen(id);
-        self.store_broadcast_message(id, packet.clone());
+        if packet.payload.len() <= FRAGMENT_SIZE_THRESHOLD {
+            self.store_broadcast_message(id, packet.clone());
+        }
         let routes: Vec<Route> = self.routes.values().cloned().collect();
         for route in routes {
-            self.send_frame(&route, &packet);
+            self.send_frame_fragmented(&route, &packet);
         }
+    }
+
+    /// Public file transfer (`MeshCore.sendFileBroadcast`): a version-2,
+    /// broadcast-recipient 0x22 packet carrying the TLV file payload.
+    async fn send_broadcast_file(&mut self, file: FilePacket) {
+        let Some(payload) = file.encode() else {
+            self.info("file too large to encode".to_string());
+            return;
+        };
+        if payload.len() > MAX_WIRE_FILE_BYTES {
+            self.info(format!(
+                "file {} ({} bytes) exceeds the mesh v1 limit of {} bytes per packet",
+                file.file_name,
+                payload.len(),
+                MAX_WIRE_FILE_BYTES
+            ));
+            return;
+        }
+        let mut packet = Packet::new(
+            MessageType::FileTransfer as u8,
+            MAX_TTL,
+            self.identity.peer_id_bytes(),
+            payload,
+        );
+        packet.version = 2;
+        packet.timestamp = now_ms();
+        packet.recipient_id = Some(BROADCAST_RECIPIENT);
+        packet.signature = self.identity.signing.sign_packet(&packet);
+        let id = Self::packet_sync_id(&packet);
+        self.mark_seen(id);
+        if packet.payload.len() <= FRAGMENT_SIZE_THRESHOLD {
+            self.store_broadcast_message(id, packet.clone());
+        }
+        self.info(format!(
+            "file sent on the common channel: {} ({} bytes, {})",
+            file.file_name, file.file_size, file.mime_type
+        ));
+        let routes: Vec<Route> = self.routes.values().cloned().collect();
+        for route in routes {
+            self.send_frame_fragmented(&route, &packet);
+        }
+    }
+
+    /// Private file transfer: Noise payload `FILE_TRANSFER` (0x20) carrying
+    /// the TLV file payload, queued until the session is established — the
+    /// phone only accepts encrypted media once PeerState unlocked the peer.
+    async fn send_private_file(&mut self, peer_id: &str, file: FilePacket) {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        if self
+            .sessions
+            .get(peer_id)
+            .map(|s| s.is_established())
+            .unwrap_or(false)
+        {
+            self.deliver_private_file(peer_id, &message_id, file);
+            return;
+        }
+        self.pending_files
+            .entry(peer_id.to_string())
+            .or_default()
+            .push((message_id, file));
+        self.initiate_handshake(peer_id).await;
+    }
+
+    /// Encrypt and send a `FILE_TRANSFER` Noise payload to an established peer.
+    fn deliver_private_file(&mut self, peer_id: &str, _message_id: &str, file: FilePacket) {
+        let Some(route) = self.routes.get(peer_id).cloned() else {
+            self.info(format!("no route to {peer_id}"));
+            return;
+        };
+        if route.is_empty() {
+            self.info(format!("no route to {peer_id}"));
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(peer_id) else {
+            self.info(format!("no session with {peer_id}"));
+            return;
+        };
+        let Some(tlv) = file.encode() else {
+            self.info("file too large to encode".to_string());
+            return;
+        };
+        if tlv.len() > MAX_WIRE_FILE_BYTES {
+            self.info(format!(
+                "file {} ({} bytes) exceeds the mesh v1 limit of {} bytes per packet",
+                file.file_name,
+                tlv.len(),
+                MAX_WIRE_FILE_BYTES
+            ));
+            return;
+        }
+        let envelope = NoisePayload::new(NoisePayloadType::FileTransfer, tlv).encode();
+        let ciphertext = match session.encrypt(&envelope) {
+            Ok(data) => data,
+            Err(e) => {
+                self.info(format!("encrypt for {peer_id} failed: {e}"));
+                return;
+            }
+        };
+        let mut packet = Packet::new(
+            MessageType::NoiseEncrypted as u8,
+            MAX_TTL,
+            self.identity.peer_id_bytes(),
+            ciphertext,
+        );
+        packet.recipient_id = peer_bytes(peer_id);
+        packet.timestamp = now_ms();
+        self.sign_and_send(&route, packet);
+        self.info(format!(
+            "file sent to {peer_id}: {} ({} bytes, {})",
+            file.file_name, file.file_size, file.mime_type
+        ));
     }
 
     fn store_broadcast_message(&mut self, id: [u8; 16], packet: Packet) {
@@ -927,8 +1102,93 @@ impl Actor {
             if same_central || same_peripheral {
                 continue; // don't send back on the arrival channel
             }
-            self.send_frame(route, &relayed);
+            self.send_frame_fragmented(route, &relayed);
         }
+    }
+
+    /// Fragment a packet when its frame exceeds the 512-byte ATT budget and
+    /// write every (fragment) frame to the route. Fragments embed the
+    /// original signed packet, so relaying a reassembled packet re-splits it
+    /// per downstream MTU instead of shipping an oversized frame.
+    fn send_frame_fragmented(&self, route: &Route, packet: &Packet) {
+        let fragments = create_fragments(packet, MAX_FRAGMENTS_PER_ID as usize);
+        if fragments.is_empty() {
+            self.info(format!(
+                "dropping packet type {:#04x}: unfragmentable ({} payload bytes)",
+                packet.packet_type,
+                packet.payload.len()
+            ));
+            return;
+        }
+        for fragment in fragments {
+            self.send_frame(route, &fragment);
+        }
+    }
+
+    /// Offer an incoming FRAGMENT to the reassembler; a completed packet is
+    /// dispatched like any other (its handler verifies, stores, and relays).
+    async fn handle_fragment(&mut self, sender: &str, packet: Packet, via: Route) {
+        match self.reassembler.handle_fragment(&packet.payload, now_ms()) {
+            Reassembly::Pending => {}
+            Reassembly::Rejected => {
+                self.reassembler.cleanup(now_ms());
+            }
+            Reassembly::Complete(reassembled) => {
+                if reassembled.packet_type == MessageType::Fragment as u8 {
+                    // A fragment-of-fragment is never produced by conforming
+                    // peers; do not recurse.
+                    return;
+                }
+                // Boxed: reassembled FRAGMENT packets re-enter this dispatcher.
+                Box::pin(self.handle_packet_route(sender, reassembled, via)).await;
+            }
+        }
+    }
+
+    /// Signed public file transfer (`MessageType.FILE_TRANSFER` 0x22), the
+    /// broadcast form of `MeshCore.sendFileBroadcast`. Directed (legacy
+    /// private) 0x22 packets are not consumed: desktop only speaks the
+    /// encrypted 0x20 form for private media.
+    async fn handle_file_transfer(&mut self, sender: &str, packet: Packet, via: Route) {
+        let is_broadcast =
+            packet.recipient_id.is_none_or(|recipient| recipient == BROADCAST_RECIPIENT);
+        if !is_broadcast {
+            self.info(format!("ignoring directed FILE_TRANSFER from {sender}"));
+            return;
+        }
+        let Some(announce) = self.peers.get(sender) else {
+            return;
+        };
+        let Ok(signing_key) = announce.signing_public_key.clone().try_into() else {
+            return;
+        };
+        if self.verified.get(sender) != Some(&true) || !verify_packet(&packet, &signing_key) {
+            return;
+        }
+        let id = Self::packet_sync_id(&packet);
+        if !self.mark_seen(id) {
+            return;
+        }
+        // Only small public files join gossip storage; a 100 KB photo is
+        // relayed but never synced, keeping the seen-cache bounded.
+        if packet.payload.len() <= FRAGMENT_SIZE_THRESHOLD {
+            self.store_broadcast_message(id, packet.clone());
+        }
+        let Some(file) = FilePacket::decode(&packet.payload) else {
+            self.info(format!("undecodable FILE_TRANSFER from {sender}"));
+            return;
+        };
+        self.info(format!(
+            "file from {sender}: {} ({} bytes, {})",
+            file.file_name,
+            file.file_size,
+            file.mime_type
+        ));
+        let _ = self.events.try_send(LinkEvent::BroadcastFile {
+            peer_id: sender.to_string(),
+            file,
+        });
+        self.relay_public_packet(&packet, &via);
     }
 
     async fn handle_noise_handshake(&mut self, sender: &str, packet: Packet, via: Route) {
@@ -1026,6 +1286,10 @@ impl Actor {
         for (message_id, content) in pending {
             self.deliver_private(peer, &message_id, &content);
         }
+        let pending_files = self.pending_files.remove(peer).unwrap_or_default();
+        for (message_id, file) in pending_files {
+            self.deliver_private_file(peer, &message_id, file);
+        }
     }
 
     async fn handle_noise_encrypted(&mut self, sender: &str, packet: Packet) {
@@ -1098,6 +1362,23 @@ impl Actor {
                             peer_id: sender.to_string(),
                             message_id,
                         });
+                    }
+                    NoisePayloadType::FileTransfer => {
+                        match FilePacket::decode(&payload.data) {
+                            Some(file) => {
+                                self.info(format!(
+                                    "file from {sender}: {} ({} bytes, {})",
+                                    file.file_name,
+                                    file.file_size,
+                                    file.mime_type
+                                ));
+                                let _ = self.events.try_send(LinkEvent::PrivateFile {
+                                    peer_id: sender.to_string(),
+                                    file,
+                                });
+                            }
+                            None => self.info(format!("undecodable file transfer from {sender}")),
+                        }
                     }
                     NoisePayloadType::PeerState => {
                         match AuthenticatedPeerState::decode(&payload.data) {
@@ -1354,7 +1635,7 @@ impl Actor {
                 );
             }
         }
-        self.send_frame(route, &packet);
+        self.send_frame_fragmented(route, &packet);
     }
 
     /// Write an already-signed packet to every channel of a route. Relays and
@@ -1411,7 +1692,11 @@ impl Actor {
 }
 
 /// Capabilities we truthfully advertise (no media transfer support yet).
-const ADVERTISED_CAPABILITIES: u64 = 0;
+/// Capability bits announced in announcements and AuthenticatedPeerState.
+/// `1 << 8` is Android `PeerCapabilities.PRIVATE_MEDIA`: without it the
+/// phone refuses to send us encrypted private media (images, voice notes),
+/// falling back to a legacy-consent gate instead.
+const ADVERTISED_CAPABILITIES: u64 = 1 << 8;
 
 /// Result of feeding a handshake message into a (possibly new) session.
 enum Feed {

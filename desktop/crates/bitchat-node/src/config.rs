@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct NodeConfig {
     pub node: NodeSection,
+    pub ui: UiSection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,6 +23,26 @@ pub struct NodeConfig {
 pub struct NodeSection {
     /// Display nickname announced to the mesh. `None` = built-in default.
     pub nickname: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSection {
+    /// Chat transcript layout (`bubbles` or `matrix`).
+    pub theme: Option<ChatTheme>,
+}
+
+/// Chat transcript presentation, mirroring the mobile `ChatUiMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatTheme {
+    /// Classic messenger bubbles: own messages right (no name), others left
+    /// with their `@nickname`, both with a greyed timestamp bottom-right.
+    #[default]
+    Bubbles,
+    /// Terminal-style flat transcript: `@nickname`, message below, timestamp
+    /// greyed and smaller on the right, everything left-aligned.
+    Matrix,
 }
 
 impl NodeConfig {

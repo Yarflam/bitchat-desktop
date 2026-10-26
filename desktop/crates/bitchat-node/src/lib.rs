@@ -7,10 +7,11 @@
 //!   Noise XX handshake (initiator and responder), encrypted private chat.
 
 pub mod config;
+pub mod gui;
 pub mod identity;
 pub mod link;
 
-pub use config::NodeConfig;
+pub use config::{ChatTheme, NodeConfig};
 pub use identity::NodeIdentity;
 pub use link::{LinkCommand, LinkEvent, MeshLink};
 

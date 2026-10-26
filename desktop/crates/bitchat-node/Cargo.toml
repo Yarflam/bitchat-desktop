@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+notify-rust = "4"
+rfd = "0.15"
 bitchat-ble = { path = "../bitchat-ble" }
 bitchat-wire = { path = "../bitchat-wire" }
 serde = { version = "1", features = ["derive"] }
@@ -14,8 +19,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+windows = { version = "0.61", features = ["ApplicationModel"] }
 
 [dev-dependencies]
-eframe = "0.31"
-notify-rust = "4"
-windows = { version = "0.61", features = ["ApplicationModel"] }
+egui_kittest = { version = "=0.31.0", features = ["eframe", "snapshot", "wgpu"] }

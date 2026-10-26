@@ -95,6 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => println!(
                     "[peerstate] from {peer_id} caps={capabilities:#x} key={signing_public_key}"
                 ),
+                LinkEvent::PrivateFile { peer_id, file } => {
+                    println!(
+                        "[file    ] private from {peer_id}: {} ({} bytes, {})",
+                        file.file_name, file.file_size, file.mime_type
+                    );
+                }
+                LinkEvent::BroadcastFile { peer_id, file } => {
+                    println!(
+                        "[file    ] broadcast from {peer_id}: {} ({} bytes, {})",
+                        file.file_name, file.file_size, file.mime_type
+                    );
+                }
                 LinkEvent::BroadcastMessage { peer_id, content } => {
                     println!("[chat    ] broadcast from {peer_id}: {content}")
                 }

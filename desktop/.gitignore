@@ -3,3 +3,9 @@
 *.identity
 *.nickname
 bitchatd.toml
+
+bitchatd_downloads/**/*
+!bitchatd_downloads/.gitkeep
+
+crates/bitchat-node/tests/snapshots/**/*
+!crates/bitchat-node/tests/snapshots/.gitkeep
